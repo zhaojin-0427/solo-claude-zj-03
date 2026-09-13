@@ -69,6 +69,32 @@ CREATE TABLE IF NOT EXISTS robust_versions (
     result             TEXT NOT NULL,             -- 选定方案的重采样统计 JSON
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS blend_experiments (
+    id                 TEXT PRIMARY KEY,          -- input_hash
+    input_hash         TEXT NOT NULL UNIQUE,
+    mode               TEXT NOT NULL,             -- linear / ternary
+    sources            TEXT NOT NULL,             -- 来源冻结版本 id 与份额快照
+    layout             TEXT NOT NULL,             -- 试片布局 [{position, weights}]
+    setup              TEXT NOT NULL,             -- 干料量/分度/最小称量/比例范围等常量
+    material_snapshot  TEXT NOT NULL,             -- 合并原料的冻结分析快照
+    constants_version  TEXT NOT NULL,
+    constants_snapshot TEXT NOT NULL,             -- 分子量/角色完整快照（JSON）
+    note               TEXT,
+    result             TEXT NOT NULL,             -- 逐格投料/釉式/烧后质量/成本 JSON
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS blend_versions (
+    id                 TEXT PRIMARY KEY,          -- input_hash
+    input_hash         TEXT NOT NULL UNIQUE,
+    experiment_id      TEXT NOT NULL,             -- 来源混合试验
+    note               TEXT,
+    search_constraints TEXT NOT NULL,             -- 母料搜索参数
+    plan               TEXT NOT NULL,             -- 选定方案（母料拆分+称量顺序）
+    source_snapshot    TEXT NOT NULL,             -- 来源配方+布局+常量完整快照
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -446,4 +472,158 @@ def _robust_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         data[key] = json.loads(data[key])
     if data.get("search_constraints"):
         data["search_constraints"] = json.loads(data["search_constraints"])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 配方混合试验（不可变）
+# ---------------------------------------------------------------------------
+
+def save_blend_experiment(
+    *,
+    input_hash: str,
+    mode: str,
+    sources: list[dict[str, Any]],
+    layout: list[dict[str, Any]],
+    setup: dict[str, Any],
+    material_snapshot: dict[str, Any],
+    constants: dict[str, Any],
+    note: Optional[str],
+    result: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """写入混合试验快照；同 hash 已存在则直接返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM blend_experiments WHERE input_hash = ?", (input_hash,)
+        ).fetchone()
+        if existing is not None:
+            return _blend_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO blend_experiments
+                   (id, input_hash, mode, sources, layout, setup,
+                    material_snapshot, constants_version, constants_snapshot,
+                    note, result)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                input_hash,
+                input_hash,
+                mode,
+                json.dumps(sources, sort_keys=True, ensure_ascii=False),
+                json.dumps(layout, sort_keys=True, ensure_ascii=False),
+                json.dumps(setup, sort_keys=True),
+                json.dumps(material_snapshot, sort_keys=True, ensure_ascii=False),
+                CONSTANTS_VERSION,
+                json.dumps(constants, sort_keys=True),
+                note,
+                json.dumps(result, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM blend_experiments WHERE input_hash = ?", (input_hash,)
+        ).fetchone()
+    return _blend_row_to_dict(row), True
+
+
+def get_blend_experiment(experiment_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM blend_experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"配方混合试验不存在: {experiment_id}", "blend_experiment_not_found"
+        )
+    return _blend_row_to_dict(row)
+
+
+def list_blend_experiments(limit: int = 50) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM blend_experiments ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_blend_row_to_dict(r) for r in rows]
+
+
+def _blend_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    for key in (
+        "sources",
+        "layout",
+        "setup",
+        "material_snapshot",
+        "constants_snapshot",
+        "result",
+    ):
+        data[key] = json.loads(data[key])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 母料拆分方案冻结（不可变）
+# ---------------------------------------------------------------------------
+
+def save_blend_version(
+    *,
+    input_hash: str,
+    experiment_id: str,
+    note: Optional[str],
+    search_constraints: dict[str, Any],
+    plan: dict[str, Any],
+    source_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """写入母料方案冻结记录；同 hash 已存在则返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM blend_versions WHERE input_hash = ?", (input_hash,)
+        ).fetchone()
+        if existing is not None:
+            return _blend_version_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO blend_versions
+                   (id, input_hash, experiment_id, note,
+                    search_constraints, plan, source_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                input_hash,
+                input_hash,
+                experiment_id,
+                note,
+                json.dumps(search_constraints, sort_keys=True, ensure_ascii=False),
+                json.dumps(plan, sort_keys=True, ensure_ascii=False),
+                json.dumps(source_snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM blend_versions WHERE input_hash = ?", (input_hash,)
+        ).fetchone()
+    return _blend_version_row_to_dict(row), True
+
+
+def get_blend_version(freeze_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM blend_versions WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"母料拆分冻结不存在: {freeze_id}", "blend_version_not_found"
+        )
+    return _blend_version_row_to_dict(row)
+
+
+def list_blend_versions(experiment_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM blend_versions WHERE experiment_id = ? "
+            "ORDER BY created_at DESC, id LIMIT ?",
+            (experiment_id, limit),
+        ).fetchall()
+    return [_blend_version_row_to_dict(r) for r in rows]
+
+
+def _blend_version_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    for key in ("search_constraints", "plan", "source_snapshot"):
+        data[key] = json.loads(data[key])
     return data

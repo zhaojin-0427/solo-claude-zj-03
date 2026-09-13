@@ -10,7 +10,10 @@ from . import db, service
 from .errors import GlazeError
 from .schemas import (
     BatchRequest,
+    BlendExperimentRequest,
+    BlendFreezeRequest,
     FreezeRequest,
+    MasterPlanRequest,
     MaterialCreate,
     MaterialUpdate,
     RobustFreezeRequest,
@@ -169,3 +172,50 @@ def list_robust_freezes(
 @router.get("/robust-versions/{freeze_id}")
 def get_robust_version(freeze_id: str) -> dict[str, Any]:
     return db.get_robust_version(freeze_id)
+
+
+# ---------------------------------------------------------------------------
+# 配方混合试验（冻结配方混料 + 试片布局 + 母料拆分）
+# ---------------------------------------------------------------------------
+
+@router.post("/blend-experiments", status_code=201)
+def create_blend_experiment(req: BlendExperimentRequest) -> dict[str, Any]:
+    """把两至三份冻结配方与一张试片布局保存为独立混合试验版本。"""
+    stored, created = service.create_blend_experiment(req)
+    return {"created": created, "experiment": stored}
+
+
+@router.get("/blend-experiments")
+def list_blend_experiments(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    return db.list_blend_experiments(limit)
+
+
+@router.get("/blend-experiments/{experiment_id}")
+def get_blend_experiment(experiment_id: str) -> dict[str, Any]:
+    return db.get_blend_experiment(experiment_id)
+
+
+@router.post("/blend-experiments/{experiment_id}/master-plans")
+def master_plans(experiment_id: str, req: MasterPlanRequest) -> dict[str, Any]:
+    """提取各格共有用量搜索"母料+逐格补料"方案并排序。"""
+    return service.master_plan_search(experiment_id, req)
+
+
+@router.post("/blend-experiments/{experiment_id}/freeze", status_code=201)
+def freeze_blend_plan(experiment_id: str, req: BlendFreezeRequest) -> dict[str, Any]:
+    """冻结选定方案：来源配方、布局、母料拆分及计算常量整体存档。"""
+    stored, created = service.freeze_blend_plan(experiment_id, req)
+    return {"created": created, "freeze": stored}
+
+
+@router.get("/blend-experiments/{experiment_id}/freezes")
+def list_blend_freezes(
+    experiment_id: str, limit: int = Query(50, ge=1, le=500)
+) -> list[dict]:
+    db.get_blend_experiment(experiment_id)  # 404: 试验不存在
+    return db.list_blend_versions(experiment_id, limit)
+
+
+@router.get("/blend-versions/{freeze_id}")
+def get_blend_version(freeze_id: str) -> dict[str, Any]:
+    return db.get_blend_version(freeze_id)

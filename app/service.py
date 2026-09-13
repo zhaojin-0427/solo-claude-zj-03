@@ -1,4 +1,4 @@
-"""业务编排：直接计算、搜索替代配方、版本冻结、批次波动研究。"""
+"""业务编排：直接计算、搜索替代配方、版本冻结、批次波动研究、混合试验。"""
 from __future__ import annotations
 
 import hashlib
@@ -7,13 +7,16 @@ from typing import Any
 
 import numpy as np
 
-from . import db, optimizer, variability
+from . import blending, db, optimizer, variability
 from .chemistry import calc_batch, deviation_summary, validate_analysis
 from .config import CONSTANTS_VERSION, constants_snapshot
 from .errors import GlazeError
 from .schemas import (
     BatchRequest,
+    BlendExperimentRequest,
+    BlendFreezeRequest,
     FreezeRequest,
+    MasterPlanRequest,
     MaterialCreate,
     OxideTarget,
     RobustFreezeRequest,
@@ -554,4 +557,254 @@ def freeze_robust(study_id: str, req: RobustFreezeRequest):
         search_constraints=constraints,
         source_snapshot=source_snapshot,
         result=result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 配方混合试验
+# ---------------------------------------------------------------------------
+
+def _collect_blend_sources(version_ids: list[str]) -> tuple[
+    list[blending.FrozenSource], dict[int, Any], list[dict[str, Any]]
+]:
+    """载入来源冻结版本，构造归一化来源与合并原料快照。
+
+    相同原料跨来源出现时，其冻结分析（氧化物 + LOI）必须一致，
+    否则两种同名/同 id 原料无法作为同一种料合并称量。
+    """
+    versions = [db.get_version(vid) for vid in version_ids]  # 404 由 db 抛出
+    sources = blending.build_sources(versions)
+
+    snapshots: dict[int, Any] = {}
+    for v in versions:
+        for mid_str, snap in v["material_snapshot"].items():
+            mid = int(mid_str)
+            current = {
+                "name": snap["name"],
+                "oxides": snap["oxides"],
+                "loi": snap["loi"],
+                "price": snap["price"],
+            }
+            if mid in snapshots:
+                prev = snapshots[mid]
+                if (
+                    prev["oxides"] != current["oxides"]
+                    or abs(prev["loi"] - current["loi"]) > 1e-12
+                ):
+                    raise GlazeError(
+                        f"原料 {mid}（{current['name']}）在不同来源版本中的冻结"
+                        "分析不一致，无法合并",
+                        "inconsistent_material_snapshot",
+                        {"material_id": mid,
+                         "version_ids": [vv["id"] for vv in versions]},
+                    )
+            else:
+                snapshots[mid] = current
+
+    sources_stored = [
+        {
+            "version_id": src.version_id,
+            "note": src.note,
+            "shares": [
+                {"material_id": mid, "share": round(share, 12)}
+                for mid, share in sorted(src.shares.items())
+            ],
+            "original_items": [
+                {"material_id": mid, "amount": amt}
+                for mid, amt in sorted(src.original_amounts.items())
+            ],
+        }
+        for src in sources
+    ]
+    return list(sources), snapshots, sources_stored
+
+
+def create_blend_experiment(req: BlendExperimentRequest):
+    """创建混合试验：校验来源/布局，逐格投料舍入，整体存档为不可变版本。"""
+    sources, snapshots, sources_stored = _collect_blend_sources(req.sources)
+
+    cells = [
+        {"position": c.position, "weights": [float(w) for w in c.weights]}
+        for c in req.cells
+    ]
+    materials, cell_records = blending.dose_cells(
+        sources=sources,
+        material_snapshots=snapshots,
+        cells=cells,
+        dry_mass_g=req.dry_mass_per_tile_g,
+        division=req.scale_division_g,
+        minimum_weighed=req.minimum_weighed_g,
+    )
+
+    material_ids = [m.material_id for m in materials]
+    layout_stored = [
+        {"position": c["position"], "weights": c["weights"]} for c in cells
+    ]
+    setup = {
+        "dry_mass_per_tile_g": req.dry_mass_per_tile_g,
+        "scale_division_g": req.scale_division_g,
+        "minimum_weighed_g": req.minimum_weighed_g,
+        "ratio_low": req.ratio_low,
+        "ratio_high": req.ratio_high,
+        "ratio_step": req.ratio_step,
+        "n_cells": len(cells),
+    }
+
+    # 逐格汇总
+    total_dry_g = req.dry_mass_per_tile_g * len(cells)
+    total_weighed_g = round(sum(c["total_weighed_g"] for c in cell_records), 6)
+    total_fired_g = round(sum(c["fired_mass_g"] for c in cell_records), 6)
+    total_cost = round(sum(c["cost"] for c in cell_records), 9)
+    per_material: dict[int, dict[str, Any]] = {
+        mid: {"material_id": mid, "theoretical_g": 0.0, "weighed_g": 0.0}
+        for mid in material_ids
+    }
+    for c in cell_records:
+        for d in c["doses"]:
+            per_material[d["material_id"]]["theoretical_g"] += d["theoretical_g"]
+            per_material[d["material_id"]]["weighed_g"] += d["weighed_g"]
+    material_totals = []
+    for mid in material_ids:
+        t = per_material[mid]
+        t["name"] = snapshots[mid]["name"]
+        t["theoretical_g"] = round(t["theoretical_g"], 6)
+        t["weighed_g"] = round(t["weighed_g"], 6)
+        t["rounding_error_g"] = round(t["weighed_g"] - t["theoretical_g"], 6)
+        material_totals.append(t)
+
+    result = {
+        "cells": cell_records,
+        "summary": {
+            "n_cells": len(cells),
+            "n_materials": len(material_ids),
+            "target_dry_mass_g": req.dry_mass_per_tile_g,
+            "total_dry_mass_g": total_dry_g,
+            "total_weighed_g": total_weighed_g,
+            "total_rounding_error_g": round(total_weighed_g - total_dry_g, 6),
+            "total_fired_mass_g": total_fired_g,
+            "total_cost": total_cost,
+            "max_abs_seger_shift": round(
+                max((c["max_abs_seger_shift"] for c in cell_records), default=0.0),
+                9,
+            ),
+        },
+        "material_totals": material_totals,
+    }
+
+    material_snapshot = {
+        str(mid): {
+            "id": mid,
+            **snapshots[mid],
+            "available": None,  # 来自冻结版本，不带可变库存
+        }
+        for mid in material_ids
+    }
+    constants = constants_snapshot()
+    hash_payload = {
+        "sources": sources_stored,
+        "mode": req.mode,
+        "layout": layout_stored,
+        "setup": setup,
+        "material_snapshot": material_snapshot,
+        "constants": constants,
+    }
+    return db.save_blend_experiment(
+        input_hash=_canonical_hash(hash_payload),
+        mode=req.mode,
+        sources=sources_stored,
+        layout=layout_stored,
+        setup=setup,
+        material_snapshot=material_snapshot,
+        constants=constants,
+        note=req.note,
+        result=result,
+    )
+
+
+def _master_search_params(req) -> dict[str, Any]:
+    return {
+        "master_batch_g": req.master_batch_g,
+        "master_minimum_weighed_g": req.master_minimum_weighed_g,
+        "allowed_leftover_g": req.allowed_leftover_g,
+        "max_candidates": req.max_candidates,
+    }
+
+
+def master_plan_search(experiment_id: str, req: MasterPlanRequest) -> dict[str, Any]:
+    """对冻结试验搜索"母料 + 逐格补料"方案并排序。"""
+    experiment = db.get_blend_experiment(experiment_id)  # 404
+    prob = blending.build_master_problem(experiment)
+    result = blending.search_master_plans(
+        prob,
+        master_batch_g=req.master_batch_g,
+        master_minimum_weighed=req.master_minimum_weighed_g,
+        allowed_leftover_g=req.allowed_leftover_g,
+        max_candidates=req.max_candidates,
+    )
+    result["experiment_id"] = experiment["id"]
+    result["constants_version"] = CONSTANTS_VERSION
+    return result
+
+
+def _run_master_search(experiment: dict[str, Any], req: BlendFreezeRequest):
+    prob = blending.build_master_problem(experiment)
+    return blending.search_master_plans(
+        prob,
+        master_batch_g=req.master_batch_g,
+        master_minimum_weighed=req.master_minimum_weighed_g,
+        allowed_leftover_g=req.allowed_leftover_g,
+        max_candidates=max(req.plan_index + 1, req.max_candidates),
+    )
+
+
+def freeze_blend_plan(experiment_id: str, req: BlendFreezeRequest):
+    """冻结选定母料拆分方案：重跑确定性搜索取 plan_index，整体存档。"""
+    experiment = db.get_blend_experiment(experiment_id)  # 404
+    result = _run_master_search(experiment, req)
+    plans = result["plans"]
+    if req.plan_index >= len(plans):
+        raise GlazeError(
+            f"候选序号 {req.plan_index} 超出范围（共 {len(plans)} 个可行方案）",
+            "plan_index_out_of_range",
+            {"plan_index": req.plan_index, "n_plans": len(plans)},
+        )
+    plan = plans[req.plan_index]
+
+    search_constraints = {
+        "master_batch_g": req.master_batch_g,
+        "master_minimum_weighed_g": req.master_minimum_weighed_g,
+        "allowed_leftover_g": req.allowed_leftover_g,
+        "max_candidates": req.max_candidates,
+        "plan_index": req.plan_index,
+        "parameters": result["parameters"],
+    }
+    source_snapshot = {
+        "experiment_id": experiment["id"],
+        "mode": experiment["mode"],
+        "sources": experiment["sources"],
+        "layout": experiment["layout"],
+        "setup": experiment["setup"],
+        "material_snapshot": experiment["material_snapshot"],
+        "cells": experiment["result"]["cells"],
+        "constants_version": experiment["constants_version"],
+        "constants_snapshot": experiment["constants_snapshot"],
+    }
+    hash_payload = {
+        "experiment_id": experiment["id"],
+        "plan_signature": plan["signature"],
+        "search_constraints": search_constraints,
+        "included": plan["included_material_ids"],
+        "bulk": [
+            {"material_id": b["material_id"], "prepared_units": b["prepared_units"]}
+            for b in plan["bulk"]
+        ],
+        "source": source_snapshot,
+    }
+    return db.save_blend_version(
+        input_hash=_canonical_hash(hash_payload),
+        experiment_id=experiment["id"],
+        note=req.note,
+        search_constraints=search_constraints,
+        plan=plan,
+        source_snapshot=source_snapshot,
     )

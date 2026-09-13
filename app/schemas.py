@@ -1,7 +1,7 @@
 """Pydantic 数据模型：原料、计算请求、搜索请求、响应结构。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -451,5 +451,230 @@ class RobustFreezeRequest(BaseModel):
         if len(set(ids)) != len(ids):
             raise GlazeError(
                 "投料表中原料重复", "duplicate_material", {"material_ids": ids}
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 配方混合试验
+# ---------------------------------------------------------------------------
+
+BlendMode = Literal["linear", "ternary"]
+
+
+class BlendCell(BaseModel):
+    """试片布局中的一个格位：位置标签 + 各来源配方比例。"""
+
+    position: str = Field(min_length=1, max_length=64, description="格位标签，如 A1")
+    weights: list[float] = Field(
+        ...,
+        min_length=2,
+        max_length=3,
+        description="各来源配方占比（合计为 1），顺序与 sources 一致",
+    )
+
+    @field_validator("weights")
+    @classmethod
+    def _check_weights(cls, v: list[float]) -> list[float]:
+        negatives = [w for w in v if w < 0.0]
+        if negatives:
+            raise GlazeError(
+                f"混合比例不得为负: {v}",
+                "negative_component",
+                {"weights": v},
+            )
+        return v
+
+
+class BlendExperimentRequest(BaseModel):
+    """创建配方混合试验：2~3 份冻结配方 + 一张试片布局。"""
+
+    sources: list[str] = Field(
+        ..., min_length=2, max_length=3,
+        description="来源冻结配方版本 id（线性 2 份 / 三元 3 份，不可重复）",
+    )
+    mode: BlendMode = Field(..., description="linear 线性混合 / ternary 三元三角")
+    cells: list[BlendCell] = Field(
+        ..., min_length=1, description="试片布局格位，位置不可重复"
+    )
+    ratio_low: float = Field(
+        0.0, ge=0.0, le=1.0, description="单一来源占比下限（含端点）"
+    )
+    ratio_high: float = Field(
+        1.0, ge=0.0, le=1.0, description="单一来源占比上限（含端点）"
+    )
+    ratio_step: Optional[float] = Field(
+        default=None, gt=0.0, le=1.0,
+        description="比例步长（给出时每个非零占比须落在其网格上）",
+    )
+    dry_mass_per_tile_g: float = Field(
+        ..., gt=0.0, description="单片干料量（g，生料）"
+    )
+    scale_division_g: float = Field(
+        ..., gt=0.0, description="电子秤分度（g/最小读数）"
+    )
+    minimum_weighed_g: float = Field(
+        ..., gt=0.0, description="电子秤最小称量（g，低于该值不称量）"
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "BlendExperimentRequest":
+        n = len(self.sources)
+        if self.mode == "linear" and n != 2:
+            raise GlazeError(
+                f"线性混合需要恰好 2 份来源配方，收到 {n} 份",
+                "mode_source_count_mismatch",
+                {"mode": self.mode, "n_sources": n, "expected": 2},
+            )
+        if self.mode == "ternary" and n != 3:
+            raise GlazeError(
+                f"三元三角混合需要恰好 3 份来源配方，收到 {n} 份",
+                "mode_source_count_mismatch",
+                {"mode": self.mode, "n_sources": n, "expected": 3},
+            )
+        if len(set(self.sources)) != n:
+            dup = sorted({s for s in self.sources if self.sources.count(s) > 1})
+            raise GlazeError(
+                f"来源配方重复提交: {dup}",
+                "duplicate_source",
+                {"version_ids": dup},
+            )
+        if self.ratio_low > self.ratio_high:
+            raise GlazeError(
+                f"比例区间矛盾: low={self.ratio_low} > high={self.ratio_high}",
+                "contradictory_bounds",
+                {"low": self.ratio_low, "high": self.ratio_high},
+            )
+        if self.minimum_weighed_g < self.scale_division_g:
+            raise GlazeError(
+                "最小称量不得小于电子秤分度",
+                "minimum_below_division",
+                {
+                    "minimum_weighed_g": self.minimum_weighed_g,
+                    "scale_division_g": self.scale_division_g,
+                },
+            )
+        # 单片干料量须落在秤的网格上（保证最大余数法可精确闭合）
+        q = self.dry_mass_per_tile_g / self.scale_division_g
+        if abs(q - round(q)) > 1e-6:
+            raise GlazeError(
+                f"单片干料量 {self.dry_mass_per_tile_g} g 不是分度 "
+                f"{self.scale_division_g} g 的整数倍",
+                "dry_mass_not_on_grid",
+                {
+                    "dry_mass_per_tile_g": self.dry_mass_per_tile_g,
+                    "scale_division_g": self.scale_division_g,
+                },
+            )
+
+        seen_positions: set[str] = set()
+        for cell in self.cells:
+            if cell.position in seen_positions:
+                raise GlazeError(
+                    f"格位标签重复: {cell.position}",
+                    "duplicate_cell_position",
+                    {"position": cell.position},
+                )
+            seen_positions.add(cell.position)
+            if len(cell.weights) != n:
+                raise GlazeError(
+                    f"格位 {cell.position} 的比例个数 {len(cell.weights)} "
+                    f"与来源数 {n} 不一致",
+                    "weights_length_mismatch",
+                    {"position": cell.position,
+                     "n_weights": len(cell.weights), "expected": n},
+                )
+            total = sum(cell.weights)
+            if abs(total - 1.0) > 1e-6:
+                raise GlazeError(
+                    f"格位 {cell.position} 比例不闭合：合计 {total}，应为 1",
+                    "weights_not_closed",
+                    {"position": cell.position, "sum": round(total, 9)},
+                )
+            for k, w in enumerate(cell.weights):
+                if w < self.ratio_low - 1e-9 or w > self.ratio_high + 1e-9:
+                    raise GlazeError(
+                        f"格位 {cell.position} 第 {k + 1} 份占比 {w} 超出 "
+                        f"[{self.ratio_low}, {self.ratio_high}]",
+                        "ratio_out_of_range",
+                        {"position": cell.position, "source_index": k,
+                         "weight": w, "low": self.ratio_low,
+                         "high": self.ratio_high},
+                    )
+            if self.ratio_step is not None:
+                for k, w in enumerate(cell.weights):
+                    qw = w / self.ratio_step
+                    if abs(qw - round(qw)) > 1e-6:
+                        raise GlazeError(
+                            f"格位 {cell.position} 第 {k + 1} 份占比 {w} "
+                            f"不是步长 {self.ratio_step} 的整数倍",
+                            "ratio_not_on_grid",
+                            {"position": cell.position, "source_index": k,
+                             "weight": w, "step": self.ratio_step},
+                        )
+        return self
+
+
+class MasterPlanRequest(BaseModel):
+    """母料拆分搜索：限定母料批量、最小称量与允许剩余量。"""
+
+    master_batch_g: Optional[float] = Field(
+        default=None, gt=0.0,
+        description="母料批量（g），须为秤分度整数倍；缺省时按等分需求精确配制",
+    )
+    master_minimum_weighed_g: Optional[float] = Field(
+        default=None, gt=0.0,
+        description="母料配料的最小称量（g），缺省沿用试验逐格秤设置",
+    )
+    allowed_leftover_g: Optional[float] = Field(
+        default=None, ge=0.0,
+        description="允许剩余料上限（g），仅在限定母料批量时生效，缺省为 0",
+    )
+    max_candidates: int = Field(
+        default=10, ge=1, le=50, description="返回方案条数上限"
+    )
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "MasterPlanRequest":
+        if (
+            self.allowed_leftover_g is not None
+            and self.master_batch_g is None
+        ):
+            raise GlazeError(
+                "未限定母料批量时不允许设置剩余料（等分配制剩余恒为 0）",
+                "leftover_without_batch",
+            )
+        return self
+
+
+class BlendFreezeItem(BaseModel):
+    """冻结方案中的母料配料项。"""
+
+    material_id: int
+    units: int = Field(..., ge=0, description="配料单位数（× 分度为克数）")
+
+
+class BlendFreezeRequest(BaseModel):
+    """冻结选定的母料拆分方案（来源配方、布局、母料拆分与计算常量整体存档）。"""
+
+    plan_index: int = Field(
+        ..., ge=0, description="母料搜索返回的候选序号（0 为 best）"
+    )
+    master_batch_g: Optional[float] = Field(default=None, gt=0.0)
+    master_minimum_weighed_g: Optional[float] = Field(default=None, gt=0.0)
+    allowed_leftover_g: Optional[float] = Field(default=None, ge=0.0)
+    max_candidates: int = Field(default=10, ge=1, le=50)
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "BlendFreezeRequest":
+        if (
+            self.allowed_leftover_g is not None
+            and self.master_batch_g is None
+        ):
+            raise GlazeError(
+                "未限定母料批量时不允许设置剩余料（等分配制剩余恒为 0）",
+                "leftover_without_batch",
             )
         return self
