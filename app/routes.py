@@ -13,7 +13,10 @@ from .schemas import (
     FreezeRequest,
     MaterialCreate,
     MaterialUpdate,
+    RobustFreezeRequest,
+    RobustSearchRequest,
     SearchRequest,
+    StudyRequest,
 )
 
 router = APIRouter()
@@ -119,3 +122,50 @@ def list_versions(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
 @router.get("/versions/{version_id}")
 def get_version(version_id: str) -> dict[str, Any]:
     return db.get_version(version_id)
+
+
+# ---------------------------------------------------------------------------
+# 原料批次波动研究（不可变研究快照 + 稳健配方冻结）
+# ---------------------------------------------------------------------------
+
+@router.post("/studies", status_code=201)
+def create_study(req: StudyRequest) -> dict[str, Any]:
+    """以一份冻结配方和一组化验批次创建独立的波动研究版本。"""
+    stored, created = service.create_study(req)
+    return {"created": created, "study": stored}
+
+
+@router.get("/studies")
+def list_studies(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    return db.list_studies(limit)
+
+
+@router.get("/studies/{study_id}")
+def get_study(study_id: str) -> dict[str, Any]:
+    return db.get_study(study_id)
+
+
+@router.post("/studies/{study_id}/robust-search")
+def robust_search(study_id: str, req: RobustSearchRequest) -> dict[str, Any]:
+    """在库存、步进与最大改动量内搜索稳健配方并排序。"""
+    return service.robust_search(study_id, req)
+
+
+@router.post("/studies/{study_id}/freeze", status_code=201)
+def freeze_robust(study_id: str, req: RobustFreezeRequest) -> dict[str, Any]:
+    """冻结选定的稳健配方：来源配方、化验数据、抽样规则与种子整体存档。"""
+    stored, created = service.freeze_robust(study_id, req)
+    return {"created": created, "freeze": stored}
+
+
+@router.get("/studies/{study_id}/freezes")
+def list_robust_freezes(
+    study_id: str, limit: int = Query(50, ge=1, le=500)
+) -> list[dict]:
+    db.get_study(study_id)  # 404: 研究不存在
+    return db.list_robust_versions(study_id, limit)
+
+
+@router.get("/robust-versions/{freeze_id}")
+def get_robust_version(freeze_id: str) -> dict[str, Any]:
+    return db.get_robust_version(freeze_id)

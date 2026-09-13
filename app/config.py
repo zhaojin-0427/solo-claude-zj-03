@@ -77,6 +77,14 @@ MIP_REL_GAP = 1e-6          # 相对间隙（釉式尺度 1e-6 足够区分排�
 DINKELBACH_ITERS = 8        # 加权偏差分式规划的最大迭代次数
 MAX_ALTERNATIVES = 5        # 替代配方最多返回条数
 
+# 批次波动研究参数
+DEFAULT_N_RESAMPLES = 400      # 默认重采样次数
+MIN_RESAMPLES = 20             # 重采样次数下限（再低统计意义不足）
+MAX_RESAMPLES = 10000          # 重采样次数上限
+DEFAULT_STUDY_SEED = 20260913  # 缺省随机种子（固定种子保证可复现）
+ROBUST_MAX_ITERS = 40          # 稳健配方搜索的贪心迭代上限
+TOP_VIOLATION_COMBOS = 5       # 结果中返回的常见越界组合条数
+
 
 class Settings(BaseModel):
     db_path: str = str(Path(__file__).resolve().parent.parent / "glaze.db")

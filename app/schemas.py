@@ -5,7 +5,13 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .config import OXIDE_CATALOG
+from .config import (
+    DEFAULT_N_RESAMPLES,
+    DEFAULT_STUDY_SEED,
+    MAX_RESAMPLES,
+    MIN_RESAMPLES,
+    OXIDE_CATALOG,
+)
 from .errors import GlazeError
 
 
@@ -267,3 +273,183 @@ class FreezeItem(BaseModel):
 class FreezeRequest(BaseModel):
     items: list[FreezeItem] = Field(min_length=1)
     note: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 原料批次波动研究
+# ---------------------------------------------------------------------------
+
+class AssayBatch(BaseModel):
+    """单批化验数据：氧化物分析 + LOI + 价格 + 可用量。"""
+
+    material_id: int
+    batch: str = Field(min_length=1, max_length=64, description="批号")
+    oxides: dict[str, float] = Field(
+        description="氧化物 -> 质量分数（百分数口径，100 g 基准下的克数）"
+    )
+    loi: float = Field(0.0, ge=0.0, le=100.0, description="灼烧减量 LOI（百分数）")
+    price: float = Field(..., ge=0.0, description="每千克单价")
+    available: float = Field(..., ge=0.0, description="该批可用量（kg）")
+    analysis_tolerance: float = Field(
+        2.0, gt=0.0, description="分析合计允许的绝对误差（百分点）"
+    )
+
+    @field_validator("oxides")
+    @classmethod
+    def _check_oxides(cls, v: dict[str, float]) -> dict[str, float]:
+        if not v:
+            raise GlazeError("批次分析至少要给出一种氧化物质量分数", "empty_analysis")
+        unknown = sorted(set(v) - set(OXIDE_CATALOG))
+        if unknown:
+            raise GlazeError(
+                f"未知氧化物: {', '.join(unknown)}",
+                "unknown_oxide",
+                {"unknown": unknown},
+            )
+        negatives = {k: x for k, x in v.items() if x < 0.0}
+        if negatives:
+            raise GlazeError(
+                f"氧化物质量分数不得为负: {negatives}",
+                "negative_component",
+                {"components": negatives},
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_analysis_sum(self) -> "AssayBatch":
+        total = sum(self.oxides.values()) + self.loi
+        if abs(total - 100.0) > self.analysis_tolerance + 1e-9:
+            raise GlazeError(
+                f"批次「{self.batch}」分析合计 {total:.3f} 超出 "
+                f"100 ± {self.analysis_tolerance} 的允许误差",
+                "analysis_sum_error",
+                {"total": round(total, 4), "allowed": 100.0,
+                 "tol": self.analysis_tolerance},
+            )
+        return self
+
+
+class StudyRequest(BaseModel):
+    """创建批次波动研究：一份冻结配方 + 一组化验批次构成独立版本。"""
+
+    version_id: str = Field(min_length=1, description="来源冻结配方版本 id")
+    batches: list[AssayBatch] = Field(
+        min_length=1, description="配方所用原料的多批化验数据"
+    )
+    linked_groups: list[list[int]] = Field(
+        default_factory=list,
+        description="同批联动抽样原料组：组内各原料批号集合须一致，抽样时共用批号",
+    )
+    targets: dict[str, OxideTarget] = Field(
+        default_factory=dict,
+        description="釉式目标区间；缺省沿用来源版本约束中的 targets",
+    )
+    n_resamples: int = Field(
+        DEFAULT_N_RESAMPLES, ge=MIN_RESAMPLES, le=MAX_RESAMPLES,
+        description="bootstrap 重采样次数",
+    )
+    seed: int = Field(DEFAULT_STUDY_SEED, ge=0, description="重采样随机种子")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "StudyRequest":
+        unknown = sorted(set(self.targets) - set(OXIDE_CATALOG))
+        if unknown:
+            raise GlazeError(
+                f"目标中存在未知氧化物: {', '.join(unknown)}",
+                "unknown_oxide",
+                {"unknown": unknown},
+            )
+        seen_batches: set[tuple[int, str]] = set()
+        for b in self.batches:
+            key = (b.material_id, b.batch)
+            if key in seen_batches:
+                raise GlazeError(
+                    f"原料 {b.material_id} 的批号「{b.batch}」重复提交",
+                    "duplicate_batch",
+                    {"material_id": b.material_id, "batch": b.batch},
+                )
+            seen_batches.add(key)
+        membership: dict[int, bool] = {}
+        for group in self.linked_groups:
+            if len(group) < 2:
+                raise GlazeError(
+                    "联动抽样组至少需要两种原料",
+                    "linked_group_conflict",
+                    {"group": group},
+                )
+            if len(set(group)) != len(group):
+                raise GlazeError(
+                    f"联动组内原料重复: {group}",
+                    "linked_group_conflict",
+                    {"group": group},
+                )
+            for mid in group:
+                if mid in membership:
+                    raise GlazeError(
+                        f"原料 {mid} 出现在多个联动组中",
+                        "linked_group_conflict",
+                        {"material_id": mid},
+                    )
+                membership[mid] = True
+        return self
+
+
+class RobustSearchRequest(BaseModel):
+    """稳健配方搜索：在库存、步进与最大改动量内调整来源配方用量。"""
+
+    max_change: float = Field(
+        ..., gt=0.0,
+        description="相对来源配方的最大总改动量（kg，各原料 |新-旧| 之和）",
+    )
+    step: float = Field(
+        0.5, gt=0.0, description="用量调整步进（kg），改动量为步进整数倍"
+    )
+    locked: list[int] = Field(
+        default_factory=list,
+        description="锁定原料 id（保持来源配方用量不变）",
+    )
+    n_resamples: Optional[int] = Field(
+        default=None, ge=MIN_RESAMPLES, le=MAX_RESAMPLES,
+        description="重采样次数，缺省沿用研究设定",
+    )
+    seed: Optional[int] = Field(
+        default=None, ge=0, description="随机种子，缺省沿用研究种子"
+    )
+    max_candidates: int = Field(5, ge=1, le=20, description="返回候选条数上限")
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "RobustSearchRequest":
+        if len(set(self.locked)) != len(self.locked):
+            raise GlazeError(
+                f"锁定原料重复: {self.locked}",
+                "duplicate_material",
+                {"material_ids": self.locked},
+            )
+        return self
+
+
+class RobustFreezeRequest(BaseModel):
+    """冻结稳健搜索选定结果：来源配方、化验数据、抽样规则与种子整体存档。"""
+
+    items: list[FreezeItem] = Field(min_length=1)
+    note: Optional[str] = None
+    n_resamples: Optional[int] = Field(
+        default=None, ge=MIN_RESAMPLES, le=MAX_RESAMPLES,
+        description="重采样次数，缺省沿用研究设定",
+    )
+    seed: Optional[int] = Field(
+        default=None, ge=0, description="随机种子，缺省沿用研究种子"
+    )
+    search_constraints: Optional[dict] = Field(
+        default=None, description="稳健搜索约束，原样存档"
+    )
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "RobustFreezeRequest":
+        ids = [i.material_id for i in self.items]
+        if len(set(ids)) != len(ids):
+            raise GlazeError(
+                "投料表中原料重复", "duplicate_material", {"material_ids": ids}
+            )
+        return self
