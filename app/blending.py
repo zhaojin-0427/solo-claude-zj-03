@@ -67,6 +67,14 @@ def is_on_grid(value: float, division: float) -> bool:
     return abs(n - round(n)) <= GRID_EPS
 
 
+def ceil_int(x: float) -> int:
+    """向上取整到最近整数（网格容差内的整数视为整数）。"""
+    n = int(x)
+    if x - n > GRID_EPS:
+        return n + 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # 来源配方与原料合并
 # ---------------------------------------------------------------------------
@@ -515,6 +523,17 @@ def search_master_plans(
     }
     common = [mid for mid in prob.material_ids if u_min[mid] > 0]
 
+    # 剩余量单位上限：严格按填写克数向下取整，不得四舍五入放宽。
+    # 例：分度 0.5 g、上限 2.4 g → 4 个单位（2.5 g 剩余即超限）。
+    if fixed:
+        leftover_cap_units = int(leftover_cap / division + GRID_EPS)
+        min_aliquot_units = max(
+            1, ceil_int(min_w / division)
+        )
+    else:
+        leftover_cap_units = None
+        min_aliquot_units = 1
+
     plans: list[dict[str, Any]] = []
     seen_sig: set[tuple] = set()
 
@@ -527,9 +546,7 @@ def search_master_plans(
             prob, included, u_min, min_w,
             fixed=fixed,
             target_units=target_units,
-            leftover_cap_units=(
-                round_int(leftover_cap / division) if fixed else None
-            ),
+            leftover_cap_units=leftover_cap_units,
             aliquot_units=aliquot_units,
         )
         if plan is not None:
@@ -545,7 +562,10 @@ def search_master_plans(
         included = {mid: j_full[mid] for mid in subset}
         if fixed:
             for A in _candidate_aliquot_sizes(
-                prob, included, target_units, leftover_cap
+                n_cells,
+                target_units,
+                leftover_cap_units,
+                min_aliquot_units,
             ):
                 consider(included, A)
         else:
@@ -598,38 +618,44 @@ def _iter_subsets(items: list[int]):
     yield list(items)
 
 
-def _candidate_aliquot_sizes(
-    prob: MasterProblem,
-    included: dict[int, int],
-    target_units: int,
-    leftover_cap_g: Optional[float],
-) -> list[int]:
-    """固定批量下为某子集候选等分粒度 A（每格取混合料的单位数）。
+# 固定批量下，每子集枚举的等分粒度上限（超出则等距下采样，端点必含）
+MAX_ALIQUOT_GRID_POINTS = 200
 
-    需求粒度为 Σj；只保留使剩余 0 ≤ T-n·A ≤ 余量上限 的 A。
-    不同取料量对应不同组成偏差/称量次数，故枚举需求以下若干网格点。
+
+def _candidate_aliquot_sizes(
+    n_cells: int,
+    target_units: int,
+    leftover_cap_units: int,
+    min_aliquot_units: int,
+) -> list[int]:
+    """固定批量下候选的每格等分粒度 A（单位：分度）。
+
+    可行区间由剩余量约束严格界定：
+
+        剩余 L = T - n·A ，要求 0 ≤ L ≤ 余量上限
+
+    故 ``A ∈ [ceil((T-余量上限)/n), floor(T/n)]``；再叠加等分称量的
+    最小称量下限。零剩余点 ``A = T/n``（整除时）始终在区间内并必被
+    枚举——母料正好耗尽的拆分不得遗漏。区间过长时等距下采样，
+    但两个端点一定保留。
     """
-    n = len(prob.positions)
-    demand_per_cell = sum(included.values())
-    if not included:
-        return []
-    cap_units = (
-        round_int(leftover_cap_g / prob.division)
-        if leftover_cap_g is not None
-        else None
+    lo = max(
+        min_aliquot_units,
+        ceil_int((target_units - leftover_cap_units) / n_cells),
     )
-    out: list[int] = []
-    for delta in range(0, n + 2):
-        A = demand_per_cell - delta
-        if A <= 0:
-            break
-        leftover = target_units - n * A
-        if leftover < 0:
-            continue
-        if cap_units is not None and leftover > cap_units:
-            continue
-        out.append(A)
-    return out
+    hi = target_units // n_cells  # floor，保证 n·A ≤ T
+    if lo > hi:
+        return []
+    span = hi - lo + 1
+    if span <= MAX_ALIQUOT_GRID_POINTS:
+        return list(range(lo, hi + 1))
+    step = span / MAX_ALIQUOT_GRID_POINTS
+    picked = {lo, hi}
+    k = 1
+    while len(picked) < MAX_ALIQUOT_GRID_POINTS:
+        picked.add(lo + int(k * step))
+        k += 1
+    return sorted(picked)
 
 
 def _plan_sort_key(p: dict[str, Any]):

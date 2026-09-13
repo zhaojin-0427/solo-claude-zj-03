@@ -494,6 +494,71 @@ def test_master_plans_leftover_cap_too_tight(client):
     assert resp.json()["error"]["code"] == "no_master_plan"
 
 
+def test_master_plans_small_batch_zero_leftover_aliquot(client):
+    """300 g 批量、零剩余：每格取 T/n=120 单位（60 g）正好耗尽母料。
+
+    该粒度（60 g）远低于全量需求等分（92.5 g），旧搜索只在需求量附近
+    向下看 n+1 个分度而漏掉，误报 no_master_plan。
+    """
+    exp, ids = _experiment(client)
+    resp = client.post(
+        f"/blend-experiments/{exp['id']}/master-plans",
+        json={"master_batch_g": 300.0, "allowed_leftover_g": 0.0,
+              "max_candidates": 50},
+    )
+    assert resp.status_code == 200, resp.text
+    best = resp.json()["best"]
+    assert best["master_batch_prepared_g"] == pytest.approx(300.0)
+    assert best["master_consumed_g"] == pytest.approx(300.0)
+    assert best["leftover_g"] == pytest.approx(0.0)
+    assert best["aliquot_total_g"] == pytest.approx(60.0)  # 300/5
+    # 每格都取 120 个分度单位的混合料
+    for cp in best["cells"]:
+        assert cp["master_aliquot"]["total_units"] == 120
+        total = cp["master_aliquot"]["total_units"] + sum(
+            d["units"] for d in cp["topup_doses"]
+        )
+        assert total == 200  # 每格 100 g 闭合
+    # 零剩余方案可以冻结
+    fr = client.post(
+        f"/blend-experiments/{exp['id']}/freeze",
+        json={"plan_index": 0, "master_batch_g": 300.0,
+              "allowed_leftover_g": 0.0, "max_candidates": 50},
+    )
+    assert fr.status_code == 201, fr.text
+    freeze = fr.json()["freeze"]
+    assert freeze["plan"]["aliquot_total_g"] == pytest.approx(60.0)
+    assert freeze["plan"]["leftover_g"] == pytest.approx(0.0)
+
+
+def test_master_plans_leftover_cap_enforced_in_grams(client):
+    """余量上限严格按克数：2.5 g 剩余不得通过 2.4 g 上限（旧逻辑四舍五入放行）。"""
+    exp, _ = _experiment(client)
+    # 需要剩余 2.5 g 的拆分（配 465 g、耗 462.5 g）
+    ok = client.post(
+        f"/blend-experiments/{exp['id']}/master-plans",
+        json={"master_batch_g": 465.0, "allowed_leftover_g": 2.5},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["best"]["leftover_g"] == pytest.approx(2.5)
+
+    # 同样拆分在 2.4 g 上限下必须被拒绝，不能进入排序/冻结
+    tight = client.post(
+        f"/blend-experiments/{exp['id']}/master-plans",
+        json={"master_batch_g": 465.0, "allowed_leftover_g": 2.4},
+    )
+    assert tight.status_code == 422
+    assert tight.json()["error"]["code"] == "no_master_plan"
+
+    fr = client.post(
+        f"/blend-experiments/{exp['id']}/freeze",
+        json={"plan_index": 0, "master_batch_g": 465.0,
+              "allowed_leftover_g": 2.4},
+    )
+    assert fr.status_code == 422
+    assert fr.json()["error"]["code"] == "no_master_plan"
+
+
 def test_master_plans_batch_not_on_grid(client):
     exp, _ = _experiment(client)
     resp = client.post(
