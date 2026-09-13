@@ -7,7 +7,7 @@ from typing import Any
 
 from . import db, optimizer
 from .chemistry import calc_batch, deviation_summary, validate_analysis
-from .config import CONSTANTS_VERSION
+from .config import CONSTANTS_VERSION, constants_snapshot
 from .schemas import (
     BatchRequest,
     FreezeRequest,
@@ -95,12 +95,14 @@ def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
         items_payload.append({"material_id": mat.id, "amount": amt})
     result = calc_batch(tuples, targets={o: req.targets[o] for o in req.targets})
     summary = deviation_summary(result, req.targets)
-    result["deviations"] = summary["per_oxide"]
+    target_results = summary["per_oxide"]
     return {
         "items": items_payload,
         "n_materials": int(sol["used"].sum()),
         "n_violations": summary["n_violations"],
         "weighted_deviation": round(summary["weighted_deviation"], 12),
+        # 每个 target 的当前釉式值、区间、绝对偏差、权重与是否达标
+        "target_results": target_results,
         "batch_mass": result["batch_mass"],
         "batch_error": round(result["batch_mass"] - req.batch_size, 9),
         "cost": round(result["cost"], 6),
@@ -117,6 +119,13 @@ def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
 
 
 def search_recipes(req: SearchRequest) -> dict[str, Any]:
+    # 整个求解生命周期静音 HiGHS C++ 层遗留的 std::cout 调试输出
+    # （该缓冲在进程退出才 flush，必须持续重定向 fd1）。
+    with optimizer._silence_native_stdout():
+        return _search_recipes_impl(req)
+
+
+def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
     all_materials = {m.id: m for m in db.list_materials()}
     mats = optimizer.prepare_materials(all_materials, req)
     targets = optimizer.build_targets(req)
@@ -232,11 +241,12 @@ def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
         constraints["items"] = sorted(
             constraints["items"], key=lambda x: x["material_id"]
         )
+    constants = constants_snapshot()
     hash_payload = {
         "items": canonical_items,
         "materials": json.loads(json.dumps(snapshot, sort_keys=True)),
         "constraints": constraints,
-        "constants_version": CONSTANTS_VERSION,
+        "constants": constants,
     }
     input_hash = _canonical_hash(hash_payload)
 
@@ -247,5 +257,6 @@ def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
         material_snapshot=snapshot,
         constraints=constraints,
         result=result,
+        constants=constants,
     )
     return stored, created

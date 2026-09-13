@@ -8,8 +8,8 @@
     s_j —— 目标氧化物 j 的越界量（釉式单位，>=0）
 
 釉式 r_j = Q_j / F（氧化物摩尔数 / 助熔摩尔总数）为分式；
-第 1 阶段越界计数用 F 的上界做大 M 线性化（精确），后续加权偏差
-阶段以"上一轮 F 为分母线性化 + 多轮重标定"逼近。
+第 1 阶段越界计数用 F 的上界做大 M 线性化（精确），加权偏差阶段
+对线性分式目标采用 Dinkelbach 迭代求全局最优。
 
 排序优先级（字典序）：
   1. 越界项数
@@ -19,14 +19,22 @@
 """
 from __future__ import annotations
 
+import contextlib
 import math
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import linprog, milp
 from scipy.optimize import Bounds, LinearConstraint
 
-from .config import MIN_FLUX_MOLES, MIN_FLUX_PER_KG, OXIDE_CATALOG, settings
+from .config import (
+    MIN_FLUX_MOLES,
+    MIN_FLUX_PER_KG,
+    OXIDE_CATALOG,
+    SEGER_TOLERANCE,
+    settings,
+)
 from .chemistry import oxides_by_role
 from .errors import GlazeError
 
@@ -63,6 +71,7 @@ class TargetData:
 def prepare_materials(materials: dict, req) -> list[MaterialData]:
     """生成参与优化的原料列表，并执行结构性矛盾检查。"""
     tol = req.batch_tolerance if req.batch_tolerance is not None else req.step
+    batch_hi = max(req.batch_size + tol, 0.0)
 
     referenced = set(req.required) | set(req.forbidden) | set(req.limits) | set(req.locked)
     missing = sorted(i for i in referenced if i not in materials)
@@ -73,6 +82,23 @@ def prepare_materials(materials: dict, req) -> list[MaterialData]:
             {"material_ids": missing},
         )
 
+    # 防御性检查（schema 通常已拦截；直接调用 service 时仍保证一致语义）
+    forbidden_locked = sorted(set(req.forbidden) & set(req.locked))
+    if forbidden_locked:
+        raise GlazeError(
+            f"原料同时被禁用与锁定用量: {forbidden_locked}",
+            "forbidden_locked_conflict",
+            {"material_ids": forbidden_locked},
+        )
+    for mid in sorted(set(req.forbidden) & set(req.limits)):
+        lim = req.limits[mid]
+        if (lim.low or 0.0) > 0.0 or (lim.high is not None and lim.high > 0.0):
+            raise GlazeError(
+                f"禁用原料 {mid} 又被赋予正用量约束",
+                "forbidden_with_positive_limit",
+                {"material_id": mid},
+            )
+
     locked_total = sum(req.locked.values())
     if locked_total > req.batch_size + tol + 1e-9:
         raise GlazeError(
@@ -82,16 +108,21 @@ def prepare_materials(materials: dict, req) -> list[MaterialData]:
             {"locked_total": locked_total, "batch_upper": req.batch_size + tol},
         )
 
+    other_cap = max(batch_hi - locked_total, 0.0)
+
     result: list[MaterialData] = []
     for mid, mat in materials.items():
         if mid in req.forbidden:
             continue
         lim = req.limits.get(mid)
-        low = lim.low if (lim and lim.low is not None) else 0.0
         high = min(
             mat.available,
             lim.high if (lim and lim.high is not None) else mat.available,
         )
+        # 任何非锁定原料的用量不可能超过“批量上限 - 已锁定总量”
+        if mid not in req.locked:
+            high = min(high, other_cap)
+        low = lim.low if (lim and lim.low is not None) else 0.0
         if low > high + 1e-9:
             raise GlazeError(
                 f"原料「{mat.name}」下限 {low} kg 高于可用上限 {high} kg"
@@ -188,9 +219,21 @@ class Problem:
             np.sum(flux_cols, axis=0) if flux_cols else np.zeros(self.n)
         )
         self.flux_max_moles = float(
-            sum(self.flux_per_kg[i] * self.mats[i].khi * self.step
+            sum(self.flux_per_kg[i] * min(self.mats[i].khi,
+                                          self.batch_hi / self.step) * self.step
                 for i in range(self.n))
         )
+        # 每个目标氧化物的摩尔量上界（按各料上限线性组合），
+        # 供大 M 线性化使用，避免用全局过宽的上界削弱 LP 松弛。
+        eff_khi = np.array([
+            min(m.khi, self.batch_hi / self.step) for m in self.mats
+        ])
+        self.oxide_max_moles: dict[str, float] = {}
+        for t in self.targets:
+            cj = self.mole_per_kg.get(t.oxide, np.zeros(self.n))
+            self.oxide_max_moles[t.oxide] = float(
+                np.dot(np.maximum(cj, 0.0), eff_khi * self.step)
+            )
 
     # ---- 变量界 / 整数性 ----
     def bounds_integrality(self):
@@ -264,23 +307,32 @@ class Problem:
 
         return LinearConstraint(np.vstack(rows), np.array(lbs), np.array(ubs))
 
-    # ---- 越界计数（精确大 M） ----
+    # ---- 越界计数（精确大 M；M 按各氧化物实际摩尔范围收紧） ----
     def stage1_constraint(self):
-        M = max(self.flux_max_moles * BIG_M_MARGIN, MIN_FLUX_MOLES * 10.0)
         rows, lbs, ubs = [], [], []
         for j, t in enumerate(self.targets):
             cj = self.mole_per_kg.get(t.oxide, np.zeros(self.n))
+            # 表达式 (cj - b*flux) 的上界按正/负系数在原料上限处取值
+            def _big_m(coef: np.ndarray) -> float:
+                m = sum(
+                    max(coef[i], 0.0) * self.mats[i].khi * self.step
+                    for i in range(self.n)
+                )
+                return max(m * BIG_M_MARGIN, MIN_FLUX_MOLES * 10.0)
+
             if t.high is not None:
+                coef = cj - (t.high + SEGER_TOLERANCE) * self.flux_per_kg
                 r = self._empty_row()
-                r[0:self.n] = (cj - t.high * self.flux_per_kg) * self.step
-                r[self.idx_z + j] = -M
+                r[0:self.n] = coef * self.step
+                r[self.idx_z + j] = -_big_m(coef)
                 rows.append(r)
                 lbs.append(-np.inf)
                 ubs.append(0.0)
             if t.low is not None:
+                coef = (t.low - SEGER_TOLERANCE) * self.flux_per_kg - cj
                 r = self._empty_row()
-                r[0:self.n] = (t.low * self.flux_per_kg - cj) * self.step
-                r[self.idx_z + j] = -M
+                r[0:self.n] = coef * self.step
+                r[self.idx_z + j] = -_big_m(coef)
                 rows.append(r)
                 lbs.append(-np.inf)
                 ubs.append(0.0)
@@ -288,22 +340,32 @@ class Problem:
             return None
         return LinearConstraint(np.vstack(rows), np.array(lbs), np.array(ubs))
 
-    # ---- 越界量（以 f_ref 为分母线性化，s 为釉式单位） ----
-    def deviation_constraint(self, f_ref: float):
+    # ---- 越界量（摩尔尺度，s_j 单位为"摩尔"；s_j/F 即釉式偏差） ----
+    def deviation_constraint(self):
+        """线性化越界量（含 SEGER_TOLERANCE 容差）。
+
+        高目标: Q_j - high_j*F - TOL·F - s_j <= 0
+        低目标: low_j*F - Q_j - TOL·F - s_j <= 0
+        即釉式偏差在 TOL 以内时 s_j 可为 0，吸收浮点/MIP 噪声。
+        """
         rows, lbs, ubs = [], [], []
         for j, t in enumerate(self.targets):
             cj = self.mole_per_kg.get(t.oxide, np.zeros(self.n))
             if t.high is not None:
                 r = self._empty_row()
-                r[0:self.n] = (cj - t.high * self.flux_per_kg) * self.step
-                r[self.idx_s + j] = -f_ref
+                r[0:self.n] = (
+                    cj - (t.high + SEGER_TOLERANCE) * self.flux_per_kg
+                ) * self.step
+                r[self.idx_s + j] = -1.0
                 rows.append(r)
                 lbs.append(-np.inf)
                 ubs.append(0.0)
             if t.low is not None:
                 r = self._empty_row()
-                r[0:self.n] = (t.low * self.flux_per_kg - cj) * self.step
-                r[self.idx_s + j] = -f_ref
+                r[0:self.n] = (
+                    (t.low - SEGER_TOLERANCE) * self.flux_per_kg - cj
+                ) * self.step
+                r[self.idx_s + j] = -1.0
                 rows.append(r)
                 lbs.append(-np.inf)
                 ubs.append(0.0)
@@ -316,11 +378,15 @@ class Problem:
         r[self.idx_z:self.idx_z + self.nt] = 1.0
         return LinearConstraint(r[None, :], value - slack, value + slack)
 
-    def weighted_dev_constraint(self, value: float, slack: float = 1e-6):
+    def weighted_dev_moles_constraint(self, value: float, slack: float = 1e-8):
+        """Σ w_j·s_j <= value（摩尔尺度加权偏差），下游阶段保真用。"""
         r = self._empty_row()
         for j, t in enumerate(self.targets):
             r[self.idx_s + j] = t.weight
-        return LinearConstraint(r[None, :], -np.inf, value + slack)
+        scale = max(abs(value), 1e-12)
+        return LinearConstraint(
+            r[None, :], -np.inf, value + slack * scale + 1e-12
+        )
 
     def ysum_constraint(self, value: float):
         r = self._empty_row()
@@ -356,21 +422,322 @@ def _merge(static: LinearConstraint, *extra: LinearConstraint | None) -> LinearC
     )
 
 
-def _milp(c, constraints, integrality, bounds):
+def heuristic_start(prob: "Problem") -> np.ndarray | None:
+    """构造一个高质量可行整数初始解（热启动）。
+
+    步骤：
+      1) Charnes-Cooper 分式 LP 求"加权越界最小"的连续配比；
+      2) 就近取整并投影到批量区间，满足锁定/必用/库存格点；
+      3) 以实际釉式计算 z（越界指示）与 s（摩尔越界量）。
+    返回完整变量向量，不可行时退回简单格点构造，再不行返回 None。
+    """
+    n = prob.n
+    step = prob.step
+
+    grids = _continuous_rounded_grids(prob)
+    if grids is None:
+        grids = np.zeros(n)
+        for i, m in enumerate(prob.mats):
+            grids[i] = m.locked_grid if m.locked_grid is not None else (
+                max(m.klo, 1.0 if m.required else 0.0)
+            )
+
+    if not _project_to_batch(prob, grids):
+        return None
+
+    # 单格邻域局部下降：在保持总量的前提下，逐格在原料间转移，
+    # 降低 (越界项数, 加权偏差)，以得到质量接近最优的整数起点。
+    grids = _local_descent(prob, grids)
+
+    amounts = grids * step
+    flux = float(np.dot(prob.flux_per_kg, amounts))
+    if flux <= MIN_FLUX_MOLES or flux < MIN_FLUX_PER_KG * float(amounts.sum()):
+        return None
+
+    x = np.zeros(prob.nvars)
+    x[0:n] = grids
+    x[prob.idx_y:prob.idx_y + n] = (grids > 0).astype(float)
+    for j, t in enumerate(prob.targets):
+        cj = prob.mole_per_kg.get(t.oxide, np.zeros(n))
+        r = float(np.dot(cj, amounts)) / flux
+        dev = 0.0
+        if t.high is not None:
+            dev = max(dev, r - t.high)
+        if t.low is not None:
+            dev = max(dev, t.low - r)
+        in_dev = 0.0 if dev <= SEGER_TOLERANCE else dev
+        x[prob.idx_z + j] = 1.0 if dev > SEGER_TOLERANCE else 0.0
+        x[prob.idx_s + j] = in_dev * flux
+    return x
+
+
+def _continuous_rounded_grids(prob: "Problem") -> np.ndarray | None:
+    """Charnes-Cooper 求连续最优配比并就近取整（含多目标权重）。"""
+    n, nt = prob.n, prob.nt
+    step = prob.step
+    rows, lo, hi = [], [], []
+
+    def add(r, l, h):
+        rows.append(np.asarray(r, float))
+        lo.append(l)
+        hi.append(h)
+
+    add(np.append(np.full(n, step), -prob.batch_lo), 0.0, np.inf)
+    add(np.append(np.full(n, step), -prob.batch_hi), -np.inf, 0.0)
+    add(np.append(prob.flux_per_kg * step, 0.0), 1.0, 1.0)
+    add(np.append((prob.flux_per_kg - MIN_FLUX_PER_KG) * step, 0.0), 0.0, np.inf)
+    for i, m in enumerate(prob.mats):
+        if m.locked_grid is not None:
+            r = np.zeros(n + 1)
+            r[i] = 1.0
+            r[n] = -m.locked_grid
+            add(r, 0.0, 0.0)
+        else:
+            r = np.zeros(n + 1)
+            r[i] = 1.0
+            r[n] = -m.klo
+            add(r, 0.0, np.inf)
+            r = np.zeros(n + 1)
+            r[i] = 1.0
+            r[n] = -m.khi
+            add(r, -np.inf, 0.0)
+            if m.required:
+                r = np.zeros(n + 1)
+                r[i] = 1.0
+                r[n] = -1.0
+                add(r, 0.0, np.inf)
+    bounds_cc = [(0.0, np.inf)] * n + [(1e-12, 1.0 / MIN_FLUX_MOLES)]
+
+    # 引入 s'(=s/F) 变量最小化加权偏差：需要扩展到 n+1+nt
+    # 直接对每个目标加权越界构造目标行（在 CC 空间 s' 为釉式偏差）
+    extra_rows = list(rows)
+    extra_lo, extra_hi = list(lo), list(hi)
+    nv = n + 1 + nt
+    for j, t in enumerate(prob.targets):
+        cj = prob.mole_per_kg.get(t.oxide, np.zeros(n))
+        if t.high is not None:
+            r = np.zeros(nv)
+            r[0:n] = (cj - t.high * prob.flux_per_kg) * step
+            r[n + 1 + j] = -1.0
+            extra_rows.append(r)
+            extra_lo.append(-np.inf)
+            extra_hi.append(0.0)
+        if t.low is not None:
+            r = np.zeros(nv)
+            r[0:n] = (t.low * prob.flux_per_kg - cj) * step
+            r[n + 1 + j] = -1.0
+            extra_rows.append(r)
+            extra_lo.append(-np.inf)
+            extra_hi.append(0.0)
+    # 原 CC 约束补齐到 nv 列
+    A_full = np.zeros((len(extra_rows), nv))
+    for idx, r in enumerate(extra_rows):
+        A_full[idx, :len(r)] = r
+    b_full = (np.array(extra_lo), np.array(extra_hi))
+    bounds_full = bounds_cc + [(0.0, np.inf)] * nt
+    cobj = np.zeros(nv)
+    for j, t in enumerate(prob.targets):
+        cobj[n + 1 + j] = t.weight
+    sol = _range_lp(cobj, A_full, b_full[0], b_full[1], bounds_full)
+    if sol is None:
+        return None
+    # k' = k/F；t=1/F ⇒ k = k'/t
+    t_val = max(sol.x[n], 1e-12)
+    cont_grids = sol.x[0:n] / t_val
+    locked = {i for i, m in enumerate(prob.mats) if m.locked_grid is not None}
+    grids = np.zeros(n)
+    for i in range(n):
+        g = prob.mats[i].locked_grid if i in locked else int(round(cont_grids[i]))
+        g = min(max(g, prob.mats[i].klo), prob.mats[i].khi)
+        grids[i] = g
+    return grids
+
+
+def _grids_score(prob: "Problem", grids: np.ndarray) -> tuple[int, float, float]:
+    """格点配方的排序键：(越界项数, 加权偏差, 成本)。"""
+    amounts = grids * prob.step
+    flux = float(np.dot(prob.flux_per_kg, amounts))
+    if flux <= MIN_FLUX_MOLES:
+        return (10**9, 1e18, 1e18)
+    nv = 0
+    wdev = 0.0
+    for t in prob.targets:
+        cj = prob.mole_per_kg.get(t.oxide, np.zeros(prob.n))
+        r = float(np.dot(cj, amounts)) / flux
+        d = 0.0
+        if t.high is not None:
+            d = max(d, r - t.high)
+        if t.low is not None:
+            d = max(d, t.low - r)
+        if d > SEGER_TOLERANCE:
+            nv += 1
+            wdev += t.weight * d
+    cost = float(np.dot([m.price for m in prob.mats], amounts))
+    return (nv, wdev, cost)
+
+
+def zset_constraint(prob: "Problem", zset: np.ndarray) -> LinearConstraint:
+    """把每个 z_j 固定为给定 0/1（具体越界集合），取代计数约束。"""
+    rows = []
+    for j in range(prob.nt):
+        r = prob._empty_row()
+        r[prob.idx_z + j] = 1.0
+        rows.append(r)
+    A = np.vstack(rows)
+    # 用紧容差把整数变量钉在 0/1，避免 MIP 解出现 0.999 取整翻转
+    vals = zset.astype(float)
+    return LinearConstraint(A, vals - 1e-8, vals + 1e-8)
+
+
+def _local_descent(prob: "Problem", grids: np.ndarray,
+                   max_passes: int = 4) -> np.ndarray:
+    """保持总量不变的单格/两格转移局部搜索，最小化 (越界, 加权偏差, 成本)。"""
+    grids = grids.astype(float).copy()
+    cur = _grids_score(prob, grids)
+    locked = {i for i, m in enumerate(prob.mats) if m.locked_grid is not None}
+    free = [i for i in range(prob.n) if i not in locked]
+    for _ in range(max_passes):
+        improved = False
+        # 单格转移
+        for src in free:
+            if grids[src] <= prob.mats[src].klo + 1e-9:
+                continue
+            for dst in free:
+                if dst == src or grids[dst] >= prob.mats[dst].khi - 1e-9:
+                    continue
+                trial = grids.copy()
+                trial[src] -= 1.0
+                trial[dst] += 1.0
+                sc = _grids_score(prob, trial)
+                if sc < cur:
+                    grids, cur, improved = trial, sc, True
+        # 两格交换（src->dst1, src->dst2 一次）帮助跳出单格平台
+        for src in free:
+            if grids[src] <= prob.mats[src].klo + 1e-9:
+                continue
+            for d1 in free:
+                if grids[d1] >= prob.mats[d1].khi - 1e-9:
+                    continue
+                for d2 in free:
+                    if d2 == src or d2 == d1 or grids[d2] >= prob.mats[d2].khi - 1e-9:
+                        continue
+                    trial = grids.copy()
+                    trial[src] -= 2.0
+                    trial[d1] += 1.0
+                    trial[d2] += 1.0
+                    if (trial >= np.array([prob.mats[i].klo for i in range(prob.n)]) - 1e-9
+                            ).all():
+                        sc = _grids_score(prob, trial)
+                        if sc < cur:
+                            grids, cur, improved = trial, sc, True
+        if not improved:
+            break
+    return grids
+
+
+def _project_to_batch(prob: "Problem", grids: np.ndarray) -> bool:
+    """把格点总量投影进批量格点区间，尊重锁定/必用/单项上下界。"""
+    lo_g = int(math.ceil(prob.batch_lo / prob.step - 1e-9))
+    hi_g = int(math.floor(prob.batch_hi / prob.step + 1e-9))
+    total = int(round(grids.sum()))
+    if total > hi_g:
+        need = total - hi_g
+        order = sorted(
+            range(prob.n),
+            key=lambda i: (
+                prob.mats[i].locked_grid is not None,
+                prob.mats[i].required,
+            ),
+        )
+        for i in order:
+            reducible = max(grids[i] - prob.mats[i].klo, 0.0)
+            cut = min(reducible, float(need))
+            grids[i] -= cut
+            need -= int(cut)
+            if need <= 0:
+                break
+        if need > 0:
+            return False
+    elif total < lo_g:
+        need = lo_g - total
+        room = np.array([
+            0.0 if prob.mats[i].locked_grid is not None
+            else prob.mats[i].khi - grids[i]
+            for i in range(prob.n)
+        ])
+        for i in np.argsort(-room):
+            add = min(room[i], float(need))
+            grids[i] += add
+            need -= int(add)
+            if need <= 0:
+                break
+        if need > 0:
+            return False
+    return True
+
+
+@contextlib.contextmanager
+def _silence_native_stdout():
+    """静音 HiGHS C++ 层直接写入 std::cout 的调试输出。
+
+    scipy 打包的 HiGHS 留有遗留的无条件 ``std::cout`` 打印
+    （``HighsMipSolverData::transform...``），``disp=False`` 与
+    ``output_flag`` 均无法关闭，且其内容在进程退出随 C++ 流缓冲
+    刷新——调用结束就恢复 fd 反而会让残留缓冲刷回真实 stdout。
+    因此整个搜索/诊断生命周期都需保持 fd1 指向 /dev/null；
+    Python 侧的 ``sys.stdout`` 先 flush，避免吞掉自己的输出。
+    """
+    import sys
+
+    sys.stdout.flush()
+    saved = os.dup(1)
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, 1)
+        yield
+        # 恢复前把 C 层 stdio（含 HiGHS 遗留的 std::cout 文本，
+        # 经 C 缓冲兼容写出）排空到 /dev/null，防止退出时刷回终端
+        try:
+            import ctypes
+
+            ctypes.CDLL(None).fflush(None)
+        except Exception:  # pragma: no cover - 非 glibc 平台退化
+            pass
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(null)
+        os.close(saved)
+
+
+def _milp(c, constraints, integrality, bounds, start=None, time_limit=None):
+    # 注：scipy 的 milp 不透传 HiGHS MIP 热启动（mip_start 仅 verbatim
+    # 且被忽略），故 start 不送入求解器；它用于调用方比较/兜底。
+    options = {
+        "time_limit": settings.milp_time_limit if time_limit is None else time_limit,
+        "mip_rel_gap": settings.mip_rel_gap,
+        "disp": False,
+    }
     try:
         return milp(
             c=c,
             constraints=constraints,
             integrality=integrality,
             bounds=bounds,
-            options={
-                "time_limit": settings.milp_time_limit,
-                "mip_rel_gap": 1e-9,
-                "disp": False,
-            },
+            options=options,
         )
     except Exception as exc:  # pragma: no cover
         raise GlazeError(f"优化求解失败: {exc}", "solver_error")
+
+
+def _full_start(prob: "Problem", sol: dict) -> np.ndarray:
+    """把 extract 的解展开为完整变量向量，作为下阶段热启动。"""
+    x = np.zeros(prob.nvars)
+    x[0:prob.n] = sol["grids"]
+    x[prob.idx_y:prob.idx_y + prob.n] = (sol["amounts"] > 0).astype(float)
+    x[prob.idx_z:prob.idx_z + prob.nt] = np.clip(sol["z"], 0.0, 1.0)
+    x[prob.idx_s:prob.idx_s + prob.nt] = np.maximum(sol["s"], 0.0)
+    return x
 
 
 def lexicographic_search(
@@ -380,51 +747,95 @@ def lexicographic_search(
     bounds, integrality = prob.bounds_integrality()
     static = prob.static_constraints(cuts)
 
-    # ---- 阶段 1：最小化越界项数 ----
+    # ---- 阶段 1：确定最小越界项数 ----
+    # 先用高质量启发式（连续分式 LP 取整）拿到可行 z 计数兜底；
+    # 再以短时限让 MILP 尝试证明/改进，超时则采用启发式值——
+    # 后续 Dinkelbach 阶段在固定越界集合下优化加权偏差。
     c1 = prob._empty_row()
     c1[prob.idx_z:prob.idx_z + prob.nt] = 1.0
-    res1 = _milp(c1, _merge(static, prob.stage1_constraint()), integrality, bounds)
-    if res1.x is None:
+    hs = heuristic_start(prob)
+    n_violations_heur = None
+    if hs is not None:
+        n_violations_heur = int(round(float(
+            hs[prob.idx_z:prob.idx_z + prob.nt].sum()
+        )))
+    res1 = _milp(
+        c1,
+        _merge(static, prob.stage1_constraint()),
+        integrality,
+        bounds,
+        start=hs,
+        time_limit=settings.stage1_time_limit if n_violations_heur is not None
+        else settings.milp_time_limit,
+    )
+    if res1.x is not None:
+        sol = prob.extract(res1.x)
+        zset = np.rint(sol["z"]).astype(int)
+    elif hs is not None:
+        sol = prob.extract(hs)
+        zset = np.rint(sol["z"]).astype(int)
+    else:
         return None
-    sol = prob.extract(res1.x)
-    n_violations = int(round(float(np.sum(sol["z"]))))
-    zfix = prob.zsum_constraint(float(n_violations))
+    # 固定“具体越界集合”。后续阶段 z 成为常数，可移除昂贵的大 M
+    # 计数约束，子问题变为普通 MILP（实测从数十秒降到亚秒级）。
+    zfix = zset_constraint(prob, zset)
 
-    # ---- 阶段 2：最小化加权偏差，分母重标定 ----
-    f_ref = max(prob.flux_max_moles, MIN_FLUX_MOLES)
-    for _ in range(max(settings.rescale_passes, 1)):
-        c2 = prob._empty_row()
-        for j, t in enumerate(prob.targets):
-            c2[prob.idx_s + j] = t.weight
-        res2 = _milp(
-            c2,
-            _merge(static, prob.stage1_constraint(), zfix,
-                   prob.deviation_constraint(f_ref)),
-            integrality,
-            bounds,
+    # ---- 阶段 2：最小化加权偏差（Dinkelbach 分式规划） ----
+    # 目标  min Σ w_j·s_j / F ，其中 s_j/F 是釉式偏差，F 为助熔摩尔数。
+    # 对线性分式（整数可行域）用 Dinkelbach 迭代：
+    #   min_k [Σ w_j·s_j - λ·F]，再以所得解的真实比值更新 λ，
+    # 残差归零即全局最优；避免固定分母线性化选错解。
+    dev_con = prob.deviation_constraint()
+    s_moles_best = None
+    if prob.nt:
+        lam = 0.0
+        seen_keys: set[tuple] = set()
+        for _ in range(max(settings.dinkelbach_iters, 1)):
+            c2 = prob._empty_row()
+            for j, t in enumerate(prob.targets):
+                c2[prob.idx_s + j] = t.weight
+            c2[0:prob.n] -= lam * prob.flux_per_kg * prob.step
+            res2 = _milp(
+                c2,
+                _merge(static, zfix, dev_con),
+                integrality,
+                bounds,
+                start=_full_start(prob, sol),
+            )
+            if res2.x is None:
+                break
+            sol = prob.extract(res2.x)
+            key = tuple(int(g) for g in sol["grids"])
+            if key in seen_keys:
+                break
+            seen_keys.add(key)
+            s_moles = float(
+                sum(prob.targets[j].weight * max(sol["s"][j], 0.0)
+                    for j in range(prob.nt))
+            )
+            flux = float(np.dot(prob.flux_per_kg, sol["amounts"]))
+            if flux <= MIN_FLUX_MOLES:
+                break
+            s_moles_best = s_moles
+            residual = res2.fun  # min 目标值 = s_moles - lam*flux
+            if abs(residual) <= 1e-8 * max(s_moles, flux, 1.0):
+                break
+            lam = s_moles / flux
+        wfix = prob.weighted_dev_moles_constraint(
+            s_moles_best if s_moles_best is not None else 0.0
         )
-        if res2.x is None:
-            break
-        sol = prob.extract(res2.x)
-        f_new = float(np.dot(prob.flux_per_kg, sol["amounts"]))
-        if f_new <= MIN_FLUX_MOLES or abs(f_new - f_ref) <= 1e-5 * max(f_ref, 1e-12):
-            f_ref = f_new if f_new > MIN_FLUX_MOLES else f_ref
-            break
-        f_ref = f_new
-
-    seger = _seger_of(prob, sol["amounts"])
-    weighted_dev = _weighted_deviation(prob.targets, seger)
-    wfix = prob.weighted_dev_constraint(weighted_dev)
+    else:
+        wfix = None
 
     # ---- 阶段 3：最小化原料种数 ----
     c3 = prob._empty_row()
     c3[prob.idx_y:prob.idx_y + prob.n] = 1.0
     res3 = _milp(
         c3,
-        _merge(static, prob.stage1_constraint(), zfix,
-               prob.deviation_constraint(f_ref), wfix),
+        _merge(static, zfix, dev_con, wfix),
         integrality,
         bounds,
+        start=_full_start(prob, sol),
     )
     if res3.x is not None:
         sol = prob.extract(res3.x)
@@ -437,10 +848,10 @@ def lexicographic_search(
         c4[i] = m.price * prob.step
     res4 = _milp(
         c4,
-        _merge(static, prob.stage1_constraint(), zfix,
-               prob.deviation_constraint(f_ref), wfix, yfix),
+        _merge(static, zfix, dev_con, wfix, yfix),
         integrality,
         bounds,
+        start=_full_start(prob, sol),
     )
     if res4.x is not None:
         sol = prob.extract(res4.x)
@@ -449,13 +860,12 @@ def lexicographic_search(
 
     # 同成本下的批量贴合 tie-break：分别极小/极大批量，取最接近目标中心者
     b0 = 0.5 * (prob.batch_lo + prob.batch_hi)
-    cons = _merge(static, prob.stage1_constraint(), zfix,
-                  prob.deviation_constraint(f_ref), wfix, yfix, cost_fix)
+    cons = _merge(static, zfix, dev_con, wfix, yfix, cost_fix)
 
     def _extreme(sign: float):
         c = prob._empty_row()
         c[0:prob.n] = sign * prob.step
-        res = _milp(c, cons, integrality, bounds)
+        res = _milp(c, cons, integrality, bounds, start=_full_start(prob, sol))
         return prob.extract(res.x) if res.x is not None else None
 
     best = sol

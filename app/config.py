@@ -66,9 +66,15 @@ MIN_FLUX_MOLES = 1e-7
 # 1e-3 mol/kg 约为纯钾长石助熔摩尔浓度（~1.8e-3）的一半。
 MIN_FLUX_PER_KG = 1e-3
 
+# 釉式偏差判定容差：小于该值的偏差视为达标（吸收浮点/MIP 间隙噪声）。
+# 取 1e-4：远小于陶艺配方关心的釉式差异（通常 1e-2 量级）。
+SEGER_TOLERANCE = 1e-4
+
 # 优化器参数
-MILP_TIME_LIMIT = 30.0      # 单次 milp 求解秒数
-RESCALE_PASSES = 2          # 釉式分数约束定点重标定轮数
+MILP_TIME_LIMIT = 20.0      # 常规 milp 求解秒数
+STAGE1_TIME_LIMIT = 3.0     # 越界计数阶段秒数（启发式兜底，不必证明到最优）
+MIP_REL_GAP = 1e-6          # 相对间隙（釉式尺度 1e-6 足够区分排序）
+DINKELBACH_ITERS = 8        # 加权偏差分式规划的最大迭代次数
 MAX_ALTERNATIVES = 5        # 替代配方最多返回条数
 
 
@@ -77,8 +83,28 @@ class Settings(BaseModel):
     analysis_tolerance: float = ANALYSIS_TOLERANCE
     min_flux_moles: float = MIN_FLUX_MOLES
     milp_time_limit: float = MILP_TIME_LIMIT
-    rescale_passes: int = RESCALE_PASSES
+    stage1_time_limit: float = STAGE1_TIME_LIMIT
+    mip_rel_gap: float = MIP_REL_GAP
+    dinkelbach_iters: int = DINKELBACH_ITERS
     max_alternatives: int = MAX_ALTERNATIVES
 
 
 settings = Settings()
+
+
+def constants_snapshot() -> dict:
+    """完整常量快照：仅凭它即可还原分子量与氧化物角色。
+
+    配方版本冻结时保存此结构（而不仅是版本号），这样即使日后
+    目录扩充或数值修订，旧版本仍能凭自身重算 Seger 釉式。
+    """
+    return {
+        "constants_version": CONSTANTS_VERSION,
+        "analysis_tolerance": ANALYSIS_TOLERANCE,
+        "min_flux_moles": MIN_FLUX_MOLES,
+        "min_flux_per_kg": MIN_FLUX_PER_KG,
+        "oxides": {
+            name: {"molwt": info.molwt, "role": info.role}
+            for name, info in OXIDE_CATALOG.items()
+        },
+    }

@@ -64,12 +64,32 @@ class MaterialCreate(MaterialBase):
 
 
 class MaterialUpdate(BaseModel):
+    """原料更新：所有字段可选，但显式传 null 视为无效更新（422）。
+
+    字段缺省表示"不修改"；显式 ``null`` 不被接受，避免误把必填列
+    写成 NULL 导致数据库错误。
+    """
+
     name: Optional[str] = Field(default=None, min_length=1)
     oxides: Optional[dict[str, float]] = None
     loi: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     price: Optional[float] = Field(default=None, ge=0.0)
     available: Optional[float] = Field(default=None, ge=0.0)
     analysis_tolerance: Optional[float] = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def _reject_explicit_null(self) -> "MaterialUpdate":
+        null_fields = [
+            name for name in self.model_fields_set
+            if getattr(self, name) is None
+        ]
+        if null_fields:
+            raise GlazeError(
+                f"以下字段不允许显式置为 null（缺省即不修改）: {null_fields}",
+                "null_update_field",
+                {"fields": null_fields},
+            )
+        return self
 
     @field_validator("oxides")
     @classmethod
@@ -192,6 +212,13 @@ class SearchRequest(BaseModel):
                 f"原料同时被必用与禁用: {overlap}",
                 "required_forbidden_conflict",
                 {"material_ids": overlap},
+            )
+        forbidden_locked = sorted(set(self.forbidden) & set(self.locked))
+        if forbidden_locked:
+            raise GlazeError(
+                f"原料同时被禁用与锁定用量: {forbidden_locked}",
+                "forbidden_locked_conflict",
+                {"material_ids": forbidden_locked},
             )
         for mid, amount in self.locked.items():
             if amount < 0:

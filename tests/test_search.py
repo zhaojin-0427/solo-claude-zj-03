@@ -125,6 +125,123 @@ def test_search_structural_infeasible(client):
     assert r["diagnosis"]["structural_issues"]
 
 
+def test_search_forbidden_and_locked_conflict(client):
+    """同一原料同时 forbidden 与 locked：必须拒绝而非忽略锁定。"""
+    resp = client.post("/search", json={
+        "batch_size": 100.0, "step": 0.5,
+        "targets": GLAZE_TARGETS,
+        "forbidden": [1],
+        "locked": {"1": 40.0},
+    })
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "forbidden_locked_conflict"
+
+
+def test_search_forbidden_with_limit_rejected(client):
+    """禁用原料又给正用量上下限同样拒绝。"""
+    resp = client.post("/search", json={
+        "batch_size": 100.0, "step": 0.5,
+        "targets": GLAZE_TARGETS,
+        "forbidden": [2],
+        "limits": {str(2): {"low": 5.0}},
+    })
+    assert resp.status_code == 422
+
+
+def test_search_target_results_complete(client):
+    """每个候选都要带每个 target 的当前值、区间与偏差。"""
+    resp = client.post("/search", json={
+        "batch_size": 100.0, "step": 0.5, "batch_tolerance": 0.5,
+        "targets": {
+            "K2O": {"low": 0.15, "high": 0.35, "weight": 2.0},
+            "CaO": {"low": 0.35, "high": 0.6},
+            "SiO2": {"low": 2.5, "high": 3.5},
+        },
+    })
+    r = resp.json()
+    tr = r["best"]["target_results"]
+    assert set(tr) == {"K2O", "CaO", "SiO2"}
+    for oxide, t in tr.items():
+        assert "value" in t and "low" in t and "high" in t
+        assert "deviation" in t and "weighted_deviation" in t
+        assert "weight" in t and "in_range" in t
+    assert tr["K2O"]["weight"] == 2.0
+    # 达标项偏差为 0 且 in_range；未达标项偏差为正
+    for oxide, t in tr.items():
+        if t["in_range"]:
+            assert t["deviation"] == 0
+        else:
+            assert t["deviation"] > 0
+
+
+def test_search_weighted_deviation_optimal_with_required(client):
+    """同为必用的两个原料：越界数相同时必须选加权偏差更小的方案。
+
+    在小原料库（3 种原料）上对整数网格暴力枚举，验证优化器返回的
+    (越界数, 加权偏差) 等于真实字典序最优。
+    """
+    import itertools
+    from app.chemistry import calc_batch, deviation_summary
+
+    created = []
+    for name, ox in [
+        ("A料", {"K2O": 20.0, "SiO2": 80.0}),
+        ("B料", {"CaO": 50.0, "SiO2": 50.0}),
+        ("C料", {"SiO2": 100.0}),
+    ]:
+        resp = client.post("/materials", json={
+            "name": name, "oxides": ox, "loi": 0.0,
+            "price": 1.0, "available": 100.0,
+        })
+        created.append(resp.json()["id"])
+    A, B, C = created
+    others = [m["id"] for m in client.get("/materials").json()
+              if m["id"] not in created]
+
+    body = {
+        "batch_size": 10.0, "step": 1.0, "batch_tolerance": 0.0,
+        "targets": {
+            "K2O":  {"low": 0.30, "high": 0.30, "weight": 3.0},
+            "CaO":  {"low": 0.40, "high": 0.40, "weight": 2.0},
+            "SiO2": {"low": 3.0, "high": 3.0, "weight": 1.0},
+        },
+        "required": [A, B],
+        "forbidden": others,
+    }
+    r = client.post("/search", json=body).json()
+    opt_grid = tuple(
+        int(round(next((i["amount"] for i in r["best"]["items"]
+                        if i["material_id"] == m), 0.0)))
+        for m in (A, B, C)
+    )
+
+    # 暴力枚举全部整数网格
+    class _T:
+        def __init__(self, d):
+            self.low, self.high, self.weight = d["low"], d["high"], d["weight"]
+
+    mats = {m["id"]: m for m in client.get("/materials").json()}
+    scored = []
+    for ka, kb, kc in itertools.product(range(0, 11), repeat=3):
+        if ka < 1 or kb < 1 or ka + kb + kc != 10:
+            continue
+        tuples = []
+        for mid, g in ((A, ka), (B, kb), (C, kc)):
+            if g == 0:
+                continue
+            m = mats[mid]
+            tuples.append((m["id"], m["name"], m["oxides"], m["loi"],
+                           m["price"], float(g)))
+        tg = {o: _T(body["targets"][o]) for o in body["targets"]}
+        res = calc_batch(tuples, targets=tg)
+        s = deviation_summary(res, tg)
+        scored.append(((s["n_violations"], round(s["weighted_deviation"], 12)),
+                       (ka, kb, kc)))
+    scored.sort(key=lambda x: x[0])
+    opt_key = next(k for k, g in scored if g == opt_grid)
+    assert opt_key == scored[0][0]
+
+
 def test_search_required_forbidden_conflict(client):
     resp = client.post("/search", json={
         "batch_size": 10.0, "step": 1.0,

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from pydantic import ValidationError
 
 from . import db, service
-from .errors import GlazeError, NotFoundError
+from .errors import GlazeError
 from .schemas import (
     BatchRequest,
     FreezeRequest,

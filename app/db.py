@@ -10,8 +10,8 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-from .config import CONSTANTS_VERSION, settings
-from .errors import GlazeError, NotFoundError
+from .config import CONSTANTS_VERSION, constants_snapshot, settings
+from .errors import NotFoundError
 from .schemas import Material, MaterialCreate, MaterialUpdate
 
 _SCHEMA = """
@@ -28,17 +28,33 @@ CREATE TABLE IF NOT EXISTS materials (
 );
 
 CREATE TABLE IF NOT EXISTS recipe_versions (
-    id                TEXT PRIMARY KEY,          -- input_hash（确定性 64 位十六进制）
-    input_hash        TEXT NOT NULL UNIQUE,
-    items             TEXT NOT NULL,             -- 冻结时的投料 [{material_id, amount}]
-    note              TEXT,
-    material_snapshot TEXT NOT NULL,             -- 冻结时原料分析全量快照
-    constraints       TEXT NOT NULL,             -- 搜索/计算请求中的约束
-    constants_version TEXT NOT NULL,             -- 计算常量版本
-    result            TEXT NOT NULL,             -- 完整计算结果 JSON
-    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    id                 TEXT PRIMARY KEY,          -- input_hash
+    input_hash         TEXT NOT NULL UNIQUE,
+    items              TEXT NOT NULL,             -- 冻结时的投料 [{material_id, amount}]
+    note               TEXT,
+    material_snapshot  TEXT NOT NULL,             -- 冻结时原料分析全量快照
+    constraints        TEXT NOT NULL,             -- 搜索/计算请求中的约束
+    constants_version  TEXT NOT NULL,             -- 计算常量版本号
+    constants_snapshot TEXT,                      -- 分子量/角色/容差完整快照（JSON）
+    result             TEXT NOT NULL,             -- 完整计算结果 JSON
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为旧库补列并回填常量快照，使既有版本也可凭自身还原分子量。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipe_versions)")}
+    if cols and "constants_snapshot" not in cols:
+        conn.execute(
+            "ALTER TABLE recipe_versions ADD COLUMN constants_snapshot TEXT"
+        )
+        snapshot = json.dumps(constants_snapshot(), sort_keys=True)
+        conn.execute(
+            "UPDATE recipe_versions SET constants_snapshot = ? "
+            "WHERE constants_snapshot IS NULL",
+            (snapshot,),
+        )
 
 
 def _connect() -> sqlite3.Connection:
@@ -64,6 +80,7 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +189,13 @@ def save_version(
     material_snapshot: dict[str, Any],
     constraints: dict[str, Any],
     result: dict[str, Any],
+    constants: Optional[dict[str, Any]] = None,
 ) -> tuple[Any, bool]:
     """写入不可变版本；同 hash 已存在则直接返回旧记录（幂等）。
 
     返回 ``(record, created)``。
     """
+    constants = constants or constants_snapshot()
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT * FROM recipe_versions WHERE input_hash = ?", (input_hash,)
@@ -186,8 +205,8 @@ def save_version(
         conn.execute(
             """INSERT INTO recipe_versions
                    (id, input_hash, items, note, material_snapshot,
-                    constraints, constants_version, result)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    constraints, constants_version, constants_snapshot, result)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 input_hash,
                 input_hash,
@@ -196,6 +215,7 @@ def save_version(
                 json.dumps(material_snapshot, sort_keys=True),
                 json.dumps(constraints, sort_keys=True),
                 CONSTANTS_VERSION,
+                json.dumps(constants, sort_keys=True),
                 json.dumps(result, sort_keys=True),
             ),
         )
@@ -228,4 +248,10 @@ def _version_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     for key in ("items", "material_snapshot", "constraints", "result"):
         data[key] = json.loads(data[key])
+    raw = data.get("constants_snapshot")
+    if raw:
+        data["constants_snapshot"] = json.loads(raw)
+    else:
+        # 旧库（迁移前创建的版本）：用当前常量补齐，保证读取结构一致
+        data["constants_snapshot"] = constants_snapshot()
     return data

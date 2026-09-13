@@ -89,6 +89,26 @@ def test_analysis_sum_custom_tolerance(client):
     assert resp.status_code == 201
 
 
+def test_patch_explicit_null_rejected(client):
+    """PATCH 显式传 null 必须返回结构化 422，而不是 500。"""
+    mid = client.get("/materials").json()[0]["id"]
+    resp = client.patch(f"/materials/{mid}", json={"price": None})
+    assert resp.status_code == 422, resp.text
+    body = resp.json()["error"]
+    assert body["code"] == "null_update_field"
+    assert "price" in body["details"]["fields"]
+    # 原料未被改动
+    assert client.get(f"/materials/{mid}").json()["price"] is not None
+
+
+def test_patch_empty_body_is_noop(client):
+    mid = client.get("/materials").json()[0]["id"]
+    before = client.get(f"/materials/{mid}").json()
+    resp = client.patch(f"/materials/{mid}", json={})
+    assert resp.status_code == 200
+    assert resp.json()["price"] == before["price"]
+
+
 def test_negative_price_rejected(client):
     resp = client.post("/materials", json={
         "name": "负价料",

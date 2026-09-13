@@ -11,9 +11,9 @@
 """
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
-from .config import MIN_FLUX_MOLES, OXIDE_CATALOG, OxideInfo
+from .config import MIN_FLUX_MOLES, OXIDE_CATALOG, SEGER_TOLERANCE
 from .errors import GlazeError
 
 # 百分数 <-> 小数
@@ -163,7 +163,12 @@ def calc_batch(
 
 
 def _deviations(seger: dict[str, float], targets: dict) -> dict:
-    """每个目标氧化物的偏差量、是否越界及加权偏差。"""
+    """每个目标氧化物的偏差量、是否越界及加权偏差。
+
+    ``in_range`` 与越界计数采用 ``SEGER_TOLERANCE`` 容差，与优化器
+    大 M / 越界量约束口径一致；但返回的 ``deviation`` 仍是相对
+    区间边界的真实越出量（容差内计 0）。
+    """
     out = {}
     for oxide, tgt in targets.items():
         low = getattr(tgt, "low", None)
@@ -171,19 +176,22 @@ def _deviations(seger: dict[str, float], targets: dict) -> dict:
         weight = getattr(tgt, "weight", 1.0)
         val = seger.get(oxide, 0.0)
         if low is None:
-            dev = max(0.0, val - high)
+            raw = max(0.0, val - high)
         elif high is None:
-            dev = max(0.0, low - val)
+            raw = max(0.0, low - val)
         else:
-            dev = max(low - val, 0.0, val - high)
+            raw = max(low - val, 0.0, val - high)
+        in_range = raw <= SEGER_TOLERANCE
+        dev = 0.0 if in_range else raw
         out[oxide] = {
             "value": round(val, 9),
             "low": low,
             "high": high,
             "deviation": round(dev, 12),
+            "raw_deviation": round(raw, 12),
             "weight": weight,
             "weighted_deviation": round(dev * weight, 12),
-            "in_range": bool(dev <= 1e-9),
+            "in_range": bool(in_range),
         }
     return out
 
