@@ -19,16 +19,26 @@
 
 母料拆分
 --------
-母料只提取**所有格位共用**的原料（"各格共有用量"）。每种入料原料按
-分度整数倍 ``j`` 从母料逐格等分（共 n 格，母料配料 n·j 单位）；逐格
-差额补料，等分与补料同样受最小称量约束。
+母料只提取**所有格位共用**的原料（"各格共有用量"）。
 
-若调用方限定母料批量 T（分度整数倍），母料各原料配料量按需求比例
-以最大余数法凑足 T：等分 n·j 单位后，多配的 e 单位留在料盆作为
-剩余料，要求 0 ≤ 剩余 ≤ allowed_leftover_g。等分保证逐格实际釉式
-与冻结方案完全一致（最大成分偏差为 0）；逐格补料越少，称量次数越少。
+* 未限定母料批量时：每种入料原料按分度整数倍 ``j``（逐格等分单位）
+  配料 n·j 单位（n 为格数），逐格取一份均质混合料等分，差额逐料补称。
+  等分组成与需求一致，逐格釉式与冻结方案完全相同（偏差 0）。
+* 限定母料批量 T（分度整数倍）时：配料按需求比例以最大余数法凑足
+  T 单位，组成可能与需求略有出入。每格取固定质量 A（单位）的均质
+  混合料，其中各原料质量按**实际配料组成** b_m/T 折算（允许小数），
+  再以最大余数法把整数补料分配到各原料并闭合每格总量。补料为正但
+  不足最小称量时该方案不可行。剩余料 T - n·A 须在允许上限内。
+  这种组成偏差会如实计入最大釉式偏移并参与排序。
 
-方案按 (最大成分偏差, 称量次数, 最小称量余量, 剩余料) 字典序排序。
+方案枚举覆盖共有料的**全部子集**（每种料要么全量入母料、要么不入），
+按 (最大成分偏差, 称量次数, 最小称量余量, 剩余料) 字典序排序。
+
+成本口径
+--------
+相同原料在不同来源配方中的冻结价格可能不同（原料单价可更新，各版本
+保留各自快照）。合并后每格该原料的有效单价按各来源在该格的实际份额
+加权，因此结果与来源排列顺序无关。
 """
 from __future__ import annotations
 
@@ -72,6 +82,8 @@ class FrozenSource:
     shares: dict[int, float]
     # material_id -> 冻结时的原始投料量（kg）
     original_amounts: dict[int, float]
+    # material_id -> 冻结时该原料在本版本中的单价（元/kg）
+    prices: dict[int, float]
 
 
 @dataclass(frozen=True)
@@ -82,9 +94,26 @@ class SourceMaterial:
     name: str
     oxides: dict[str, float]
     loi: float
-    price: float
     # 各来源配方归一化后该原料的 kg/kg 干料份额，顺序与 sources 一致
     fractions: tuple[float, ...]
+    # 各来源该原料的单价（元/kg），顺序与 fractions 一致
+    prices: tuple[float, ...]
+
+    def effective_price(self, weights: Sequence[float]) -> float:
+        """该格混合后此原料的有效单价：按各来源实际份额加权。
+
+        weights 为该格各来源占比（合计为 1）；该料在格内来自来源 s
+        的质量为 fractions[s]·weights[s]，成本按来源单价分别计价。
+        """
+        mass = sum(f * w for f, w in zip(self.fractions, weights) if w > 0)
+        if mass <= 0.0:
+            return self.prices[0]
+        cost_mass = sum(
+            f * w * p
+            for f, w, p in zip(self.fractions, weights, self.prices)
+            if w > 0
+        )
+        return cost_mass / mass
 
 
 def build_sources(versions: Sequence[dict[str, Any]]) -> tuple[FrozenSource, ...]:
@@ -96,11 +125,13 @@ def build_sources(versions: Sequence[dict[str, Any]]) -> tuple[FrozenSource, ...
     sources: list[FrozenSource] = []
     for v in versions:
         totals: dict[int, float] = {}
+        prices: dict[int, float] = {}
         for item in v["items"]:
             amt = float(item["amount"])
             if amt > 0.0:
                 mid = int(item["material_id"])
                 totals[mid] = totals.get(mid, 0.0) + amt
+                prices[mid] = float(v["material_snapshot"][str(mid)]["price"])
         batch_mass = sum(totals.values())
         if batch_mass <= 0.0:
             raise ValueError(f"来源配方 {v['id']} 没有正用量原料")
@@ -110,6 +141,7 @@ def build_sources(versions: Sequence[dict[str, Any]]) -> tuple[FrozenSource, ...
                 note=v.get("note"),
                 shares={mid: amt / batch_mass for mid, amt in totals.items()},
                 original_amounts=dict(sorted(totals.items())),
+                prices=prices,
             )
         )
     return tuple(sources)
@@ -119,7 +151,7 @@ def merge_materials(
     sources: Sequence[FrozenSource],
     material_snapshots: dict[int, dict[str, Any]],
 ) -> list[SourceMaterial]:
-    """合并相同原料：叠加各来源份额，分析/价格取冻结快照（首现者）。"""
+    """合并相同原料：叠加各来源份额，单价按来源分别保留（加权在格内做）。"""
     merged: dict[int, SourceMaterial] = {}
     n_src = len(sources)
     for s_idx, src in enumerate(sources):
@@ -128,25 +160,29 @@ def merge_materials(
             existing = merged.get(mid)
             if existing is None:
                 fractions = [0.0] * n_src
+                prices = [0.0] * n_src
                 fractions[s_idx] = share
+                prices[s_idx] = src.prices[mid]
                 merged[mid] = SourceMaterial(
                     material_id=mid,
                     name=snap["name"],
                     oxides=snap["oxides"],
                     loi=snap["loi"],
-                    price=snap["price"],
                     fractions=tuple(fractions),
+                    prices=tuple(prices),
                 )
             else:
                 fractions = list(existing.fractions)
+                prices = list(existing.prices)
                 fractions[s_idx] = share
+                prices[s_idx] = src.prices[mid]
                 merged[mid] = SourceMaterial(
                     material_id=mid,
                     name=existing.name,
                     oxides=existing.oxides,
                     loi=existing.loi,
-                    price=existing.price,
                     fractions=tuple(fractions),
+                    prices=tuple(prices),
                 )
     return [merged[mid] for mid in sorted(merged)]
 
@@ -273,20 +309,28 @@ def _build_cell_record(
     dry_mass_g: float,
     division: float,
 ) -> dict[str, Any]:
-    """组装单格结果：投料表、舍入误差、釉式、烧后质量、成本。"""
+    """组装单格结果：投料表、舍入误差、釉式、烧后质量、成本。
+
+    化学组成与成本分开计算：组成对相同原料与价格无关；成本则按该格
+    各来源实际份额对单价加权后的有效单价计算（与来源排列顺序无关）。
+    """
     mat_by_id = {m.material_id: m for m in materials}
     doses: list[dict[str, Any]] = []
     actual_tuples = []
     theory_tuples = []
     total_weighed = 0.0
+    total_cost = 0.0
     for mid in sorted(units):
         mat = mat_by_id[mid]
         u = units[mid]
         weighed_g = u * division
         theory_g = theoretical.get(mid, 0.0)
         total_weighed += weighed_g
+        eff_price = mat.effective_price(weights)
+        line_cost = weighed_g * KG_PER_G * eff_price
+        total_cost += line_cost
         actual_tuples.append(
-            (mid, mat.name, mat.oxides, mat.loi, mat.price,
+            (mid, mat.name, mat.oxides, mat.loi, eff_price,
              weighed_g * KG_PER_G)
         )
         doses.append({
@@ -295,13 +339,15 @@ def _build_cell_record(
             "theoretical_g": round(theory_g, 6),
             "weighed_g": round(weighed_g, 6),
             "units": u,
+            "effective_price_per_kg": round(eff_price, 9),
+            "cost": round(line_cost, 9),
             "rounding_error_g": round(weighed_g - theory_g, 6),
         })
     for mid, grams in theoretical.items():
         mat = mat_by_id[mid]
         theory_tuples.append(
-            (mid, mat.name, mat.oxides, mat.loi, mat.price,
-             grams * KG_PER_G)
+            (mid, mat.name, mat.oxides, mat.loi,
+             mat.effective_price(weights), grams * KG_PER_G)
         )
 
     actual = calc_batch(actual_tuples, targets={})
@@ -320,7 +366,7 @@ def _build_cell_record(
         "doses": doses,
         "fired_mass_g": round(actual["fired_mass"] / KG_PER_G, 6),
         "loss_on_ignition_g": round(actual["loss_on_ignition"] / KG_PER_G, 6),
-        "cost": round(actual["cost"], 9),
+        "cost": round(total_cost, 9),
         "seger": actual["seger"],
         "seger_shift_from_theoretical": seger_shift,
         "max_abs_seger_shift": round(
@@ -338,14 +384,15 @@ def _build_cell_record(
 
 @dataclass(frozen=True)
 class MasterProblem:
-    """母料搜索的冻结试验上下文（单位均为 g）。"""
+    """母料搜索的冻结试验上下文（质量单位均为 g）。"""
 
     positions: tuple[str, ...]
     material_ids: tuple[int, ...]
     names: dict[int, str]
     oxides: dict[int, dict[str, float]]
     loi: dict[int, float]
-    price: dict[int, float]
+    # 逐格有效单价（元/kg）：price[(mid, pos)]
+    price: dict[tuple[int, str], float]
     # 逐格实际称量单位（分度倍数）：u[(mid, pos)]，缺格视为 0
     units: dict[tuple[int, str], int]
     division: float
@@ -362,11 +409,11 @@ def build_master_problem(experiment: dict[str, Any]) -> MasterProblem:
     dry_mass_g = float(setup["dry_mass_per_tile_g"])
     positions: list[str] = []
     units: dict[tuple[int, str], int] = {}
+    price: dict[tuple[int, str], float] = {}
     mids: set[int] = set()
     names: dict[int, str] = {}
     oxides: dict[int, dict[str, float]] = {}
     loi: dict[int, float] = {}
-    price: dict[int, float] = {}
     baseline: dict[str, dict[str, float]] = {}
     for cell in experiment["result"]["cells"]:
         pos = cell["position"]
@@ -376,12 +423,17 @@ def build_master_problem(experiment: dict[str, Any]) -> MasterProblem:
             mid = int(d["material_id"])
             mids.add(mid)
             units[(mid, pos)] = int(d["units"])
+            # 冻结记录中已存该格有效单价；旧记录缺字段时退回原料快照价
+            price[(mid, pos)] = float(
+                d.get("effective_price_per_kg")
+                if d.get("effective_price_per_kg") is not None
+                else experiment["material_snapshot"][str(mid)]["price"]
+            )
     for mid in sorted(mids):
         snap = experiment["material_snapshot"][str(mid)]
         names[mid] = snap["name"]
         oxides[mid] = snap["oxides"]
         loi[mid] = snap["loi"]
-        price[mid] = snap["price"]
     return MasterProblem(
         positions=tuple(positions),
         material_ids=tuple(sorted(mids)),
@@ -397,28 +449,8 @@ def build_master_problem(experiment: dict[str, Any]) -> MasterProblem:
     )
 
 
-def _skeleton_lambdas(n_materials: int) -> list[dict[int, float]]:
-    """生成候选骨架（统一覆盖比例 λ、留一与单料），覆盖不同拆分粒度。"""
-    indices = list(range(n_materials))
-    skeletons: list[dict[int, float]] = []
-    # 1) 统一覆盖比例 0.05..1.0
-    for k in range(1, 21):
-        lam = round(0.05 * k, 2)
-        skeletons.append({i: lam for i in indices})
-    # 2) λ=1 时逐料留一
-    for skip in indices:
-        skeletons.append({i: 1.0 for i in indices if i != skip})
-    # 3) 单料入母料
-    for i in indices:
-        skeletons.append({i: 1.0})
-    seen: set[tuple] = set()
-    uniq: list[dict[int, float]] = []
-    for sk in skeletons:
-        key = tuple(sorted(sk.items()))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(sk)
-    return uniq
+# 共有料子集全枚举的上限：超出后退回启发式（陶艺配方实际原料数远小于此）
+MAX_SUBSET_ENUMERATE = 18
 
 
 def search_master_plans(
@@ -431,9 +463,10 @@ def search_master_plans(
 ) -> dict[str, Any]:
     """搜索"母料 + 逐格补料"方案并排序。
 
-    固定批量（``master_batch_g``）时，母料配料总量恰为 T，等分需求
-    D=n·d·Σj 之外多配的部分留作剩余料，要求剩余 ≤ allowed_leftover_g；
-    不给定批量时母料按等分需求精确配制（剩余 0）。
+    枚举共有料的全部子集（每种料要么以逐格最小用量全量入母料，要么
+    不入；固定批量下额外尝试与需求总量最接近的等分粒度）。非固定批量
+    模式下等分组成与需求一致，釉式偏差恒为 0；固定批量模式按实际
+    配料组成与实际取用量计算偏差。
     """
     from .errors import GlazeError
 
@@ -468,9 +501,11 @@ def search_master_plans(
         )
         if leftover_cap < 0.0:
             raise GlazeError("允许剩余量不得为负", "invalid_master_parameter")
+        target_units = round_int(target_g / division)
     else:
         target_g = None
         leftover_cap = None
+        target_units = None
 
     n_cells = len(prob.positions)
     # 母料只收所有格位共用的原料：某格缺料（端点格常见）则不具共有性。
@@ -483,44 +518,38 @@ def search_master_plans(
     plans: list[dict[str, Any]] = []
     seen_sig: set[tuple] = set()
 
-    def consider(j: dict[int, int]) -> None:
-        j_common = {mid: j.get(mid, 0) for mid in common if j.get(mid, 0) > 0}
-        sig = tuple(sorted(j_common.items()))
+    def consider(included: dict[int, int], aliquot_units: Optional[int]) -> None:
+        sig = (aliquot_units, tuple(sorted(included.items())))
         if sig in seen_sig:
             return
         seen_sig.add(sig)
         plan = _evaluate_plan(
-            prob, j_common, u_min, min_w,
-            fixed=fixed, target_g=target_g, leftover_cap=leftover_cap,
+            prob, included, u_min, min_w,
+            fixed=fixed,
+            target_units=target_units,
+            leftover_cap_units=(
+                round_int(leftover_cap / division) if fixed else None
+            ),
+            aliquot_units=aliquot_units,
         )
         if plan is not None:
             plans.append(plan)
 
     if not fixed:
-        consider({})  # 无母料基线
+        consider({}, None)  # 无母料基线
 
-    # 骨架只在共有料上展开（非共有料永远逐格单独称量）
-    for skel in _skeleton_lambdas(len(common)):
-        # 主选 j：可行（j ≤ u_min）范围内最接近 λ·u_min 的非零整数
-        j_round: dict[int, int] = {}
-        j_floor: dict[int, int] = {}
-        active = False
-        for i, mid in enumerate(common):
-            lam = skel.get(i, 0.0)
-            cap = u_min[mid]
-            if lam <= 0.0:
-                j_round[mid] = 0
-                j_floor[mid] = 0
-                continue
-            target = lam * cap
-            jr = min(max(round_int(target), 1), cap)
-            j_round[mid] = jr
-            j_floor[mid] = min(max(int(target), 1 if target >= 1.0 else 0), cap)
-            active = True
-        if active:
-            consider(j_round)
-            if fixed and j_floor != j_round:
-                consider(j_floor)
+    # ---- 候选：共有料全量子集（全量入母料 = 逐格最小用量）----
+    j_full = {mid: u_min[mid] for mid in common}
+    subsets = _iter_subsets(common)
+    for subset in subsets:
+        included = {mid: j_full[mid] for mid in subset}
+        if fixed:
+            for A in _candidate_aliquot_sizes(
+                prob, included, target_units, leftover_cap
+            ):
+                consider(included, A)
+        else:
+            consider(included, None)
 
     if not plans:
         raise GlazeError(
@@ -550,6 +579,59 @@ def search_master_plans(
     }
 
 
+def _iter_subsets(items: list[int]):
+    """枚举全部子集（含空集）；超过上限时退化为留一/成对/单料启发式。"""
+    m = len(items)
+    if m <= MAX_SUBSET_ENUMERATE:
+        for mask in range(1 << m):
+            yield [items[i] for i in range(m) if mask & (1 << i)]
+        return
+    # 启发式兜底：空集、单料、成对、留一、全集
+    yield []
+    for i in items:
+        yield [i]
+    for i in range(m):
+        for k in range(i + 1, m):
+            yield [items[i], items[k]]
+    for i in range(m):
+        yield [items[k] for k in range(m) if k != i]
+    yield list(items)
+
+
+def _candidate_aliquot_sizes(
+    prob: MasterProblem,
+    included: dict[int, int],
+    target_units: int,
+    leftover_cap_g: Optional[float],
+) -> list[int]:
+    """固定批量下为某子集候选等分粒度 A（每格取混合料的单位数）。
+
+    需求粒度为 Σj；只保留使剩余 0 ≤ T-n·A ≤ 余量上限 的 A。
+    不同取料量对应不同组成偏差/称量次数，故枚举需求以下若干网格点。
+    """
+    n = len(prob.positions)
+    demand_per_cell = sum(included.values())
+    if not included:
+        return []
+    cap_units = (
+        round_int(leftover_cap_g / prob.division)
+        if leftover_cap_g is not None
+        else None
+    )
+    out: list[int] = []
+    for delta in range(0, n + 2):
+        A = demand_per_cell - delta
+        if A <= 0:
+            break
+        leftover = target_units - n * A
+        if leftover < 0:
+            continue
+        if cap_units is not None and leftover > cap_units:
+            continue
+        out.append(A)
+    return out
+
+
 def _plan_sort_key(p: dict[str, Any]):
     # 最大成分偏差、称量次数、（负）最小称量余量、剩余料，签名兜底稳定
     return (
@@ -563,105 +645,153 @@ def _plan_sort_key(p: dict[str, Any]):
 
 def _evaluate_plan(
     prob: MasterProblem,
-    j: dict[int, int],
+    included_in: dict[int, int],
     u_min: dict[int, int],
     master_minimum_weighed: float,
     *,
     fixed: bool,
-    target_g: Optional[float],
-    leftover_cap: Optional[float],
+    target_units: Optional[int],
+    leftover_cap_units: Optional[int],
+    aliquot_units: Optional[int],
 ) -> Optional[dict[str, Any]]:
-    """评估单个等分向量 j；违反约束返回 None。"""
+    """评估单个方案；违反约束返回 None。
+
+    included_in: mid -> 每格等分所需的该料单位数 j_m（非固定批量下
+    母料配料恰为 n·j_m）。固定批量下 aliquot_units 给出每格实际取料
+    单位 A，各料实际取用量按母料**实际配料组成**折算。
+    """
     division = prob.division
     n_cells = len(prob.positions)
-    included = {mid: jj for mid, jj in j.items() if jj > 0}
+    included = dict(included_in)
     if not included:
         return None if fixed else _baseline_plan(prob)
 
-    # 母料配料单位 = j × 格数；配料最小称量用母料秤参数
-    bulk_units = {mid: jj * n_cells for mid, jj in included.items()}
-    for mid, b in bulk_units.items():
-        if b * division < master_minimum_weighed - GRID_EPS * division:
+    # ---- 母料配料 ----
+    if not fixed:
+        # 精确模式：每料配 n·j_m，等分组成与需求一致，无剩余
+        prepared_units = {mid: j * n_cells for mid, j in included.items()}
+        aliquot_A = sum(included.values())
+        leftover_units = 0
+        consumed_units = sum(prepared_units.values())
+    else:
+        # 固定批量：需求 D = n·Σj；每格取 A 单位混合料，消耗 n·A
+        demanded_per_cell = sum(included.values())
+        A = aliquot_units
+        if A is None or A <= 0 or A > demanded_per_cell + GRID_EPS:
             return None
-
-    # 固定批量：需求总量 D 与剩余 L = T - D
-    demanded_units = sum(bulk_units.values())
-    demanded_g = demanded_units * division
-    if fixed:
-        target_units = round_int(target_g / division)
-        leftover_units = target_units - demanded_units
+        consumed_units = n_cells * A
+        leftover_units = target_units - consumed_units
         if leftover_units < 0:
             return None
-        if leftover_units * division - leftover_cap > GRID_EPS * division:
+        if leftover_cap_units is not None and leftover_units > leftover_cap_units:
             return None
-        leftover_g = leftover_units * division
-        # 母料各原料配料量：按需求比例把 T 单位以最大余数法分配；
-        # 等分只取 j·n 单位，多分的部分留在盆中作剩余料（不入格）。
-        prepared_units: dict[int, int] = {}
+        # 配料按需求比例把 T 单位最大余数法分配到各料
+        demanded_total = n_cells * demanded_per_cell
+        prepared_units = {}
         fracs: list[tuple[float, int]] = []
-        for mid, b in bulk_units.items():
-            x = b * target_units / demanded_units
+        for mid, j in included.items():
+            x = (j * n_cells) * target_units / demanded_total
             prepared_units[mid] = int(x)
             fracs.append((x - int(x), mid))
         extra_total = target_units - sum(prepared_units.values())
+        if extra_total < 0:
+            return None
         for _, mid in sorted(fracs, key=lambda t: (-t[0], t[1]))[:extra_total]:
             prepared_units[mid] += 1
-    else:
-        leftover_g = 0.0
-        prepared_units = dict(bulk_units)
+        aliquot_A = A
 
-    cell_plans: list[dict[str, Any]] = []
-    # 称量次数：母料配料每种原料 1 次 + 每格取 1 次混合料等分 + 逐格补料
-    n_bulk = len(bulk_units)
-    aliquot_total_units = sum(included.values())  # 每格等分总单位（各料相同）
-    aliquot_total_g = aliquot_total_units * division
-    n_cells_with_aliquot = sum(
-        1 for pos in prob.positions
-        if any(prob.units.get((mid, pos), 0) > 0 for mid in included)
-    )
-    n_aliquot = n_cells_with_aliquot
-    n_topup = 0
-    margins: list[float] = []
+    # 配料最小称量（母料秤）
     for mid, b in prepared_units.items():
-        margins.append(b * division - master_minimum_weighed)
+        if b * division < master_minimum_weighed - GRID_EPS * division:
+            return None
+
+    # ---- 逐格取料/补料 ----
+    cell_plans: list[dict[str, Any]] = []
+    n_bulk = len(prepared_units)
+    n_aliquot = 0
+    n_topup = 0
+    margins: list[float] = [
+        b * division - master_minimum_weighed for b in prepared_units.values()
+    ]
 
     for pos in prob.positions:
-        master_doses: list[dict[str, Any]] = []
-        topup_doses: list[dict[str, Any]] = []
-        tuples = []
-        cell_aliquot_units = 0
-        for mid in prob.material_ids:
-            u = prob.units.get((mid, pos), 0)
-            if mid in included:
-                a = included[mid]
-                # 共有性：入母料的原料必须每格都用到，且等分不超过该格用量
-                if u <= 0 or a > u:
-                    return None
-                master_doses.append(_dose_entry(prob, mid, a))
-                cell_aliquot_units += a
-                top = u - a
-                if top > 0:
-                    if top * division < prob.minimum_weighed - GRID_EPS * division:
-                        return None  # 补料低于最小称量
-                    topup_doses.append(_dose_entry(prob, mid, top))
-                    margins.append(top * division - prob.minimum_weighed)
-                    n_topup += 1
-                tuples.append(_tuple(prob, mid, u))
-            elif u > 0:
-                if u * division < prob.minimum_weighed - GRID_EPS * division:
-                    return None
-                topup_doses.append(_dose_entry(prob, mid, u))
-                margins.append(u * division - prob.minimum_weighed)
-                n_topup += 1
-                tuples.append(_tuple(prob, mid, u))
+        u = {
+            mid: prob.units.get((mid, pos), 0)
+            for mid in prob.material_ids
+        }
+        # 入母料的料必须每格都用到且等分不超过用量（共有性）
+        if any(u.get(mid, 0) <= 0 for mid in included):
+            return None
 
-        if cell_aliquot_units > 0:
-            # 混合料等分作为一次称量，总量不得低于最小称量
-            aliquot_g = cell_aliquot_units * division
-            if aliquot_g < prob.minimum_weighed - GRID_EPS * division:
+        aliquot_components: dict[int, float] = {}
+        topup_units: dict[int, int] = {}
+        if not fixed:
+            for mid, j in included.items():
+                if j > u[mid]:
+                    return None
+                aliquot_components[mid] = float(j)
+                t = u[mid] - j
+                if t > 0:
+                    topup_units[mid] = t
+            # 未入母料但该格用到的料：逐格单独称量
+            for mid in prob.material_ids:
+                if mid not in included and u[mid] > 0:
+                    topup_units[mid] = u[mid]
+        else:
+            # 实际取料：A 单位均质混合料按**实际配料组成** b_m/T 折算，
+            # 各料分量允许小数（称的是混合料，不是逐料上秤）。
+            for mid, b in prepared_units.items():
+                aliquot_components[mid] = b * aliquot_A / target_units
+            # 理想补料 = 目标 - 等分实取（非负）；补料总量恒为 U_cell - A
+            ideal: dict[int, float] = {}
+            for mid in prob.material_ids:
+                ideal[mid] = max(u[mid] - aliquot_components.get(mid, 0.0), 0.0)
+            total_topup = round_int(sum(u.values()) - aliquot_A)
+            if total_topup < 0:
                 return None
-            margins.append(aliquot_g - prob.minimum_weighed)
+            floors = {mid: int(v) for mid, v in ideal.items()}
+            shortfall = total_topup - sum(floors.values())
+            order = sorted(
+                ideal, key=lambda m: (-(ideal[m] - floors[m]), -ideal[m], m)
+            )
+            topup_units = dict(floors)
+            for mid in order[: max(shortfall, 0)]:
+                topup_units[mid] = topup_units.get(mid, 0) + 1
+            # 等分实取超过该料目标用量时，理想补料被钳为 0，无法闭合
+            if shortfall < 0 or any(
+                topup_units.get(mid, 0) > u[mid] for mid in included
+            ):
+                return None
+            topup_units = {m: v for m, v in topup_units.items() if v > 0}
 
+        # 最小称量：正值补料逐料校验
+        for mid, t in topup_units.items():
+            if t * division < prob.minimum_weighed - GRID_EPS * division:
+                return None
+            margins.append(t * division - prob.minimum_weighed)
+        n_topup += len(topup_units)
+
+        # 等分混合料作为一次称量（各料分量允许小数：称的是均质混合料）
+        aliquot_g = aliquot_A * division
+        if aliquot_g < prob.minimum_weighed - GRID_EPS * division:
+            return None
+        margins.append(aliquot_g - prob.minimum_weighed)
+        n_aliquot += 1
+
+        actual_units: dict[int, float] = {}
+        for mid in prob.material_ids:
+            actual_units[mid] = (
+                aliquot_components.get(mid, 0.0) + topup_units.get(mid, 0)
+            )
+        tuples = [
+            (
+                mid, prob.names[mid], prob.oxides[mid], prob.loi[mid],
+                prob.price[(mid, pos)],
+                actual_units[mid] * division * KG_PER_G,
+            )
+            for mid in prob.material_ids
+            if actual_units[mid] > ZERO_EPS
+        ]
         actual = calc_batch(tuples, targets={})
         base = prob.baseline_seger[pos]
         shift = {
@@ -669,14 +799,35 @@ def _evaluate_plan(
             for o in sorted(set(actual["seger"]) | set(base))
         }
         cell_max = max((abs(v) for v in shift.values()), default=0.0)
+
+        master_doses = [
+            {
+                "material_id": mid,
+                "name": prob.names[mid],
+                "units": (
+                    included[mid]
+                    if not fixed
+                    else round(aliquot_components[mid], 6)
+                ),
+                "weighed_g": round(aliquot_components[mid] * division, 6),
+            }
+            for mid in sorted(included)
+            if aliquot_components.get(mid, 0.0) > ZERO_EPS
+        ]
         cell_plans.append({
             "position": pos,
             "master_aliquot": {
-                "total_units": cell_aliquot_units,
-                "total_g": round(cell_aliquot_units * division, 6),
+                "total_units": aliquot_A,
+                "total_g": round(aliquot_g, 6),
                 "components": master_doses,
-            } if cell_aliquot_units else None,
-            "topup_doses": topup_doses,
+            },
+            "topup_doses": [
+                _dose_entry(prob, mid, topup_units[mid])
+                for mid in sorted(topup_units)
+            ],
+            "actual_units": {
+                str(mid): round(v, 6) for mid, v in actual_units.items() if v > 0
+            },
             "seger": actual["seger"],
             "seger_shift": shift,
             "max_abs_seger_shift": round(cell_max, 9),
@@ -687,9 +838,9 @@ def _evaluate_plan(
     )
     signature = ",".join(
         f"{mid}:{included[mid]}" for mid in sorted(included)
-    )
+    ) + (f"@A{aliquot_A}" if fixed else "")
     prepared_g = sum(prepared_units.values()) * division
-    return {
+    plan = {
         "signature": signature,
         "included_material_ids": sorted(included),
         "bulk": [
@@ -698,16 +849,17 @@ def _evaluate_plan(
                 "name": prob.names[mid],
                 "prepared_units": prepared_units[mid],
                 "prepared_g": round(prepared_units[mid] * division, 6),
+                "required_units": included[mid] * n_cells,
                 "aliquot_units": included[mid],
                 "aliquot_g": round(included[mid] * division, 6),
                 "n_aliquots": n_cells,
             }
             for mid in sorted(prepared_units)
         ],
-        "aliquot_total_g": round(aliquot_total_g, 6),
+        "aliquot_total_g": round(aliquot_A * division, 6),
         "master_batch_prepared_g": round(prepared_g, 6),
-        "master_consumed_g": round(demanded_g, 6),
-        "leftover_g": round(leftover_g, 6),
+        "master_consumed_g": round(consumed_units * division, 6),
+        "leftover_g": round(leftover_units * division, 6),
         "total_weighings": n_bulk + n_aliquot + n_topup,
         "n_bulk_weighings": n_bulk,
         "n_aliquot_weighings": n_aliquot,
@@ -715,8 +867,65 @@ def _evaluate_plan(
         "min_weighing_margin_g": round(min(margins), 6),
         "max_abs_seger_shift": round(max_dev, 9),
         "cells": cell_plans,
-        "weighing_order": _weighing_order(prob, included, prepared_units),
+        "weighing_order": None,
     }
+    plan["weighing_order"] = _build_weighing_order(
+        prob, prepared_units, cell_plans
+    )
+    return plan
+
+
+def _build_weighing_order(
+    prob: MasterProblem,
+    prepared_units: dict[int, int],
+    cell_plans: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """从方案对象生成称量顺序：先逐料配母料，再逐格取等分、逐料补料。
+
+    固定批量下每格等分的各料分量可能为小数（均质混合料按组成折算），
+    补料则是最大余数法确定的整数，顺序必须与 ``cell_plans`` 完全一致，
+    因此在此统一由方案对象构建，避免独立逻辑产生分歧。
+    """
+    order: list[dict[str, Any]] = []
+    step = 0
+    for mid in sorted(prepared_units):
+        step += 1
+        order.append({
+            "step": step,
+            "stage": "bulk",
+            "position": None,
+            "material_id": mid,
+            "name": prob.names[mid],
+            "action": "weigh_master_batch",
+            "weighed_g": round(prepared_units[mid] * prob.division, 6),
+        })
+    for cp in cell_plans:
+        pos = cp["position"]
+        ma = cp["master_aliquot"]
+        if ma is not None:
+            step += 1
+            order.append({
+                "step": step,
+                "stage": "aliquot",
+                "position": pos,
+                "material_id": None,
+                "name": "母料等分",
+                "action": "take_master_aliquot",
+                "weighed_g": ma["total_g"],
+                "components": ma["components"],
+            })
+        for d in cp["topup_doses"]:
+            step += 1
+            order.append({
+                "step": step,
+                "stage": "topup",
+                "position": pos,
+                "material_id": d["material_id"],
+                "name": d["name"],
+                "action": "weigh_topup",
+                "weighed_g": d["weighed_g"],
+            })
+    return order
 
 
 def _baseline_plan(prob: MasterProblem) -> dict[str, Any]:
@@ -731,7 +940,7 @@ def _baseline_plan(prob: MasterProblem) -> dict[str, Any]:
             u = prob.units.get((mid, pos), 0)
             if u > 0:
                 topup_doses.append(_dose_entry(prob, mid, u))
-                tuples.append(_tuple(prob, mid, u))
+                tuples.append(_tuple(prob, mid, u, pos))
                 total += 1
                 margins.append(u * prob.division - prob.minimum_weighed)
         actual = calc_batch(tuples, targets={})
@@ -739,14 +948,18 @@ def _baseline_plan(prob: MasterProblem) -> dict[str, Any]:
             "position": pos,
             "master_aliquot": None,
             "topup_doses": topup_doses,
+            "actual_units": {
+                str(d["material_id"]): d["units"] for d in topup_doses
+            },
             "seger": actual["seger"],
             "seger_shift": {o: 0.0 for o in sorted(actual["seger"])},
             "max_abs_seger_shift": 0.0,
         })
-    return {
+    plan = {
         "signature": "none",
         "included_material_ids": [],
         "bulk": [],
+        "aliquot_total_g": 0.0,
         "master_batch_prepared_g": 0.0,
         "master_consumed_g": 0.0,
         "leftover_g": 0.0,
@@ -757,8 +970,10 @@ def _baseline_plan(prob: MasterProblem) -> dict[str, Any]:
         "min_weighing_margin_g": round(min(margins), 6),
         "max_abs_seger_shift": 0.0,
         "cells": cell_plans,
-        "weighing_order": _weighing_order(prob, {}, {}),
+        "weighing_order": None,
     }
+    plan["weighing_order"] = _build_weighing_order(prob, {}, cell_plans)
+    return plan
 
 
 def _dose_entry(prob: MasterProblem, mid: int, units: int) -> dict[str, Any]:
@@ -770,73 +985,12 @@ def _dose_entry(prob: MasterProblem, mid: int, units: int) -> dict[str, Any]:
     }
 
 
-def _tuple(prob: MasterProblem, mid: int, units: int):
+def _tuple(prob: MasterProblem, mid: int, units: float, pos: str):
     return (
         mid,
         prob.names[mid],
         prob.oxides[mid],
         prob.loi[mid],
-        prob.price[mid],
+        prob.price[(mid, pos)],
         units * prob.division * KG_PER_G,
     )
-
-
-def _weighing_order(
-    prob: MasterProblem,
-    included: dict[int, int],
-    prepared_units: dict[int, int],
-) -> list[dict[str, Any]]:
-    """称量顺序：先逐料配母料，再逐格"取一次混合料等分 → 逐料补料"。"""
-    order: list[dict[str, Any]] = []
-    step = 0
-    for mid in sorted(included):
-        step += 1
-        order.append({
-            "step": step,
-            "stage": "bulk",
-            "position": None,
-            "material_id": mid,
-            "name": prob.names[mid],
-            "action": "weigh_master_batch",
-            "weighed_g": round(prepared_units[mid] * prob.division, 6),
-        })
-    for pos in prob.positions:
-        components: list[dict[str, Any]] = []
-        aliquot_units = 0
-        for mid in sorted(included):
-            u = prob.units.get((mid, pos), 0)
-            if u <= 0:
-                continue
-            components.append({
-                "material_id": mid,
-                "name": prob.names[mid],
-                "units": included[mid],
-            })
-            aliquot_units += included[mid]
-        if components:
-            step += 1
-            order.append({
-                "step": step,
-                "stage": "aliquot",
-                "position": pos,
-                "material_id": None,
-                "name": "母料等分",
-                "action": "take_master_aliquot",
-                "weighed_g": round(aliquot_units * prob.division, 6),
-                "components": components,
-            })
-        for mid in prob.material_ids:
-            u = prob.units.get((mid, pos), 0)
-            top = u - included.get(mid, 0) if mid in included and u > 0 else u
-            if top > 0:
-                step += 1
-                order.append({
-                    "step": step,
-                    "stage": "topup",
-                    "position": pos,
-                    "material_id": mid,
-                    "name": prob.names[mid],
-                    "action": "weigh_topup",
-                    "weighed_g": round(top * prob.division, 6),
-                })
-    return order

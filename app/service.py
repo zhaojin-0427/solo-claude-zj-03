@@ -570,7 +570,11 @@ def _collect_blend_sources(version_ids: list[str]) -> tuple[
     """载入来源冻结版本，构造归一化来源与合并原料快照。
 
     相同原料跨来源出现时，其冻结分析（氧化物 + LOI）必须一致，
-    否则两种同名/同 id 原料无法作为同一种料合并称量。
+    否则两种同名/同 id 原料无法作为同一种料合并称量。**价格允许
+    不同**：原料单价可在两次冻结之间更新，合并后每格该原料按各
+    来源的实际份额加权计价（见 :meth:`SourceMaterial.effective_price`）。
+    快照中的价格取首现来源，仅作展示与哈希兜底；真实成本以各来源
+    价格与份额计算。
     """
     versions = [db.get_version(vid) for vid in version_ids]  # 404 由 db 抛出
     sources = blending.build_sources(versions)
@@ -606,11 +610,13 @@ def _collect_blend_sources(version_ids: list[str]) -> tuple[
             "version_id": src.version_id,
             "note": src.note,
             "shares": [
-                {"material_id": mid, "share": round(share, 12)}
+                {"material_id": mid, "share": round(share, 12),
+                 "price_per_kg": src.prices[mid]}
                 for mid, share in sorted(src.shares.items())
             ],
             "original_items": [
-                {"material_id": mid, "amount": amt}
+                {"material_id": mid, "amount": amt,
+                 "price_per_kg": src.prices[mid]}
                 for mid, amt in sorted(src.original_amounts.items())
             ],
         }

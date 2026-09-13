@@ -458,11 +458,30 @@ def test_master_plans_fixed_batch_with_leftover(client):
     bulk = {b["material_id"]: b for b in best["bulk"]}
     total_prepared = sum(b["prepared_units"] for b in bulk.values())
     assert total_prepared == 930
-    # 白云石份额恰整除；钾长石/方解石/石英按余数补齐
-    assert bulk[ids["白云石"]]["prepared_units"] == 25
     assert bulk[ids["钾长石"]]["prepared_units"] == 503
-    # 逐格只取等分，釉式不变
-    assert best["max_abs_seger_shift"] == 0.0
+    assert bulk[ids["方解石"]]["prepared_units"] == 151
+    assert bulk[ids["白云石"]]["prepared_units"] == 25
+    assert bulk[ids["石英"]]["prepared_units"] == 251
+
+    # 每格取 92.5 g 混合料，其中各料按实际配料组成折算（允许小数分量），
+    # 整数补料闭合每格总量；C 格釉式偏移最大，必须如实计入而不是 0
+    for cp in best["cells"]:
+        comp = {c["material_id"]: c for c in cp["master_aliquot"]["components"]}
+        assert comp[ids["钾长石"]]["units"] == pytest.approx(503 * 185 / 930)
+        top_total = sum(d["units"] for d in cp["topup_doses"])
+        assert top_total + cp["master_aliquot"]["total_units"] == 200
+    assert best["max_abs_seger_shift"] == pytest.approx(0.002039628, abs=1e-8)
+    shifts = [cp["max_abs_seger_shift"] for cp in best["cells"]]
+    assert max(shifts) == pytest.approx(0.002039628, abs=1e-8)
+    # 称量顺序中的补料与方案逐格补料一致
+    for cp in best["cells"]:
+        order_top = [
+            s for s in best["weighing_order"]
+            if s["stage"] == "topup" and s["position"] == cp["position"]
+        ]
+        assert [s["material_id"] for s in order_top] == [
+            d["material_id"] for d in cp["topup_doses"]
+        ]
 
 
 def test_master_plans_leftover_cap_too_tight(client):
@@ -510,6 +529,149 @@ def test_master_plans_experiment_not_found(client):
         "/blend-experiments/deadbeef/master-plans", json={}
     )
     assert resp.status_code == 404
+
+
+def _two_common_sources(client):
+    """两份配方：钾长石/石英为两格恒量共有料，方解石/白云石各差 1 g。
+
+    A = 钾长石 40 / 方解石 19.5 / 白云石 10.5 / 石英 30
+    B = 钾长石 40 / 方解石 18.5 / 白云石 11.5 / 石英 30
+    布局 A、A、B；最小称量 2 g（4 个分度），故 1 g 差量不能单独补称，
+    把方解石/白云石纳入母料的方案全部不可行，只有钾长石/石英可入母料。
+    """
+    ids = _id_map(client)
+    a = _freeze(client, [
+        {"material_id": ids["钾长石"], "amount": 40.0},
+        {"material_id": ids["方解石"], "amount": 19.5},
+        {"material_id": ids["白云石"], "amount": 10.5},
+        {"material_id": ids["石英"], "amount": 30.0},
+    ])
+    b = _freeze(client, [
+        {"material_id": ids["钾长石"], "amount": 40.0},
+        {"material_id": ids["方解石"], "amount": 18.5},
+        {"material_id": ids["白云石"], "amount": 11.5},
+        {"material_id": ids["石英"], "amount": 30.0},
+    ])
+    return ids, a, b
+
+
+def test_master_plans_covers_all_common_subsets(client):
+    """四种共有料、三格、最小称量 2 g：必须找到 11 次的二原料方案。"""
+    ids, a, b = _two_common_sources(client)
+    resp = client.post("/blend-experiments", json={
+        "sources": [a, b], "mode": "linear",
+        "cells": [
+            {"position": "A1", "weights": [1.0, 0.0]},
+            {"position": "A2", "weights": [1.0, 0.0]},
+            {"position": "B1", "weights": [0.0, 1.0]},
+        ],
+        "dry_mass_per_tile_g": 100.0,
+        "scale_division_g": 0.5,
+        "minimum_weighed_g": 2.0,
+    })
+    assert resp.status_code == 201, resp.text
+    exp = resp.json()["experiment"]
+
+    plans = client.post(
+        f"/blend-experiments/{exp['id']}/master-plans",
+        json={"max_candidates": 20},
+    ).json()
+    # 无母料基线：4 料 × 3 格 = 12 次
+    baseline = next(p for p in plans["plans"] if p["signature"] == "none")
+    assert baseline["total_weighings"] == 12
+    # {钾长石,石英} 母料：2 配料 + 3 等分 + 6 补料 = 11 次
+    pair = next(
+        p for p in plans["plans"]
+        if set(p["included_material_ids"]) == {ids["钾长石"], ids["石英"]}
+    )
+    assert pair["total_weighings"] == 11
+    # 方解石/白云石差量仅 1 g < 最小称量 2 g：凡纳入它们的方案均不可行
+    for p in plans["plans"]:
+        assert ids["方解石"] not in p["included_material_ids"]
+        assert ids["白云石"] not in p["included_material_ids"]
+    # best 即二原料方案（旧启发式会漏掉它，把 12 次基线排最前）
+    assert plans["best"]["signature"] == pair["signature"]
+    assert plans["best"]["total_weighings"] == 11
+
+
+def test_master_plans_subset_weighing_order_consistent(client):
+    ids, a, b = _two_common_sources(client)
+    exp = client.post("/blend-experiments", json={
+        "sources": [a, b], "mode": "linear",
+        "cells": [
+            {"position": "A1", "weights": [1.0, 0.0]},
+            {"position": "A2", "weights": [1.0, 0.0]},
+            {"position": "B1", "weights": [0.0, 1.0]},
+        ],
+        "dry_mass_per_tile_g": 100.0, "scale_division_g": 0.5,
+        "minimum_weighed_g": 2.0,
+    }).json()["experiment"]
+    best = client.post(
+        f"/blend-experiments/{exp['id']}/master-plans", json={}
+    ).json()["best"]
+    # 每个格位：等分混合料分量 + 补料必须还原冻结用量
+    frozen = {c["position"]: {d["material_id"]: d["units"]
+                              for d in c["doses"]}
+              for c in exp["result"]["cells"]}
+    for cp in best["cells"]:
+        got: dict[int, float] = {}
+        for comp in cp["master_aliquot"]["components"]:
+            got[comp["material_id"]] = got.get(comp["material_id"], 0) + comp["units"]
+        for d in cp["topup_doses"]:
+            got[d["material_id"]] = got.get(d["material_id"], 0) + d["units"]
+        assert got == frozen[cp["position"]]
+
+
+def test_blend_cost_weighted_and_order_invariant(client):
+    """同料异价：中点成本按各来源份额加权，交换来源顺序结果不变。"""
+    ids = _id_map(client)
+    # 钾长石在 A 冻结后改价，再冻结 B：同料两价
+    a = _freeze(client, [
+        {"material_id": ids["钾长石"], "amount": 50.0},
+        {"material_id": ids["方解石"], "amount": 20.0},
+        {"material_id": ids["石英"], "amount": 30.0},
+    ])
+    client.patch(f"/materials/{ids['钾长石']}", json={"price": 12.0})
+    b = _freeze(client, [
+        {"material_id": ids["钾长石"], "amount": 50.0},
+        {"material_id": ids["方解石"], "amount": 20.0},
+        {"material_id": ids["石英"], "amount": 30.0},
+    ])
+    assert a != b  # 不同价格 → 不同版本哈希
+
+    def midpoint(source_ids):
+        return client.post("/blend-experiments", json={
+            "sources": source_ids, "mode": "linear",
+            "cells": [{"position": "M", "weights": [0.5, 0.5]}],
+            "dry_mass_per_tile_g": 100.0, "scale_division_g": 0.5,
+            "minimum_weighed_g": 1.0,
+        }).json()["experiment"]["result"]["cells"][0]
+
+    cell_ab = midpoint([a, b])
+    cell_ba = midpoint([b, a])
+    # 中点 50 g 钾长石：25 g 来自 2.4 元/kg、25 g 来自 12 元/kg
+    expected_k = 0.025 * 2.4 + 0.025 * 12.0
+    k_dose = next(d for d in cell_ab["doses"] if d["material_id"] == ids["钾长石"])
+    assert k_dose["effective_price_per_kg"] == pytest.approx(7.2)
+    assert k_dose["cost"] == pytest.approx(expected_k)
+    assert cell_ab["cost"] == pytest.approx(cell_ba["cost"])
+    # 交换顺序前后逐格有效单价一致
+    assert {d["material_id"]: d["effective_price_per_kg"] for d in cell_ab["doses"]} == \
+        {d["material_id"]: d["effective_price_per_kg"] for d in cell_ba["doses"]}
+    # 端点格仍取对应来源的真实价格，而不是快照首现价
+    endpoint = client.post("/blend-experiments", json={
+        "sources": [a, b], "mode": "linear",
+        "cells": [
+            {"position": "P", "weights": [1.0, 0.0]},
+            {"position": "Q", "weights": [0.0, 1.0]},
+        ],
+        "dry_mass_per_tile_g": 100.0, "scale_division_g": 0.5,
+        "minimum_weighed_g": 1.0,
+    }).json()["experiment"]["result"]["cells"]
+    pk = next(d for d in endpoint[0]["doses"] if d["material_id"] == ids["钾长石"])
+    qk = next(d for d in endpoint[1]["doses"] if d["material_id"] == ids["钾长石"])
+    assert pk["effective_price_per_kg"] == pytest.approx(2.4)
+    assert qk["effective_price_per_kg"] == pytest.approx(12.0)
 
 
 # ---------------------------------------------------------------------------
