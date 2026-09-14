@@ -29,6 +29,21 @@ CREATE TABLE IF NOT EXISTS materials (
     updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS moisture_measurements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id     INTEGER NOT NULL,
+    lot             TEXT NOT NULL,          -- 适用批号
+    sample_mass_g   REAL NOT NULL,          -- 取样（湿料）质量
+    dried_mass_g    REAL NOT NULL,          -- 烘干后质量
+    moisture_pct    REAL NOT NULL,          -- 湿基含水率（百分数）
+    valid_from      TEXT NOT NULL,          -- 生效起始日（含，YYYY-MM-DD）
+    valid_to        TEXT NOT NULL,          -- 生效截止日（含）
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (material_id) REFERENCES materials(id),
+    UNIQUE (material_id, lot, sample_mass_g, dried_mass_g, valid_from, valid_to)
+);
+
 CREATE TABLE IF NOT EXISTS recipe_versions (
     id                 TEXT PRIMARY KEY,          -- input_hash
     input_hash         TEXT NOT NULL UNIQUE,
@@ -38,6 +53,7 @@ CREATE TABLE IF NOT EXISTS recipe_versions (
     constraints        TEXT NOT NULL,             -- 搜索/计算请求中的约束
     constants_version  TEXT NOT NULL,             -- 计算常量版本号
     constants_snapshot TEXT,                      -- 分子量/角色/容差完整快照（JSON）
+    moisture_plan      TEXT,                      -- 冻结时的批号湿料称量方案（JSON）
     result             TEXT NOT NULL,             -- 完整计算结果 JSON
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -154,6 +170,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE recipe_versions SET constants_snapshot = ? "
             "WHERE constants_snapshot IS NULL",
             (snapshot,),
+        )
+    # 既有版本冻结时没有含水称量方案：回退为按干料称量，保持原结果
+    if cols and "moisture_plan" not in cols:
+        conn.execute(
+            "ALTER TABLE recipe_versions ADD COLUMN moisture_plan TEXT"
         )
 
 
@@ -279,6 +300,115 @@ def delete_material(material_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 原料含水测定（只追加、不可变）
+# ---------------------------------------------------------------------------
+
+def _moisture_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "material_id": row["material_id"],
+        "lot": row["lot"],
+        "sample_mass_g": row["sample_mass_g"],
+        "dried_mass_g": row["dried_mass_g"],
+        "moisture_fraction": row["moisture_pct"] / 100.0,
+        "moisture_pct": row["moisture_pct"],
+        "valid_from": row["valid_from"],
+        "valid_to": row["valid_to"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_moisture_measurements(
+    material_id: Optional[int] = None,
+    lot: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM moisture_measurements"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if material_id is not None:
+        clauses.append("material_id = ?")
+        params.append(material_id)
+    if lot is not None:
+        clauses.append("lot = ?")
+        params.append(lot)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY material_id, valid_from, id"
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [_moisture_row_to_dict(r) for r in rows]
+
+
+def find_overlapping_moisture(
+    material_id: int, lot: str, valid_from: str, valid_to: str
+) -> Optional[dict[str, Any]]:
+    """返回同原料同批号生效区间重叠（闭区间相交）的既有测定。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT * FROM moisture_measurements
+               WHERE material_id = ? AND lot = ?
+                 AND valid_from <= ? AND valid_to >= ?
+               ORDER BY id LIMIT 1""",
+            (material_id, lot, valid_to, valid_from),
+        ).fetchone()
+    return _moisture_row_to_dict(row) if row is not None else None
+
+
+def create_moisture_measurement(
+    *,
+    material_id: int,
+    lot: str,
+    sample_mass_g: float,
+    dried_mass_g: float,
+    moisture_pct: float,
+    valid_from: str,
+    valid_to: str,
+    note: Optional[str],
+) -> dict[str, Any]:
+    """追加一条不可变含水测定；完全重复的记录幂等返回旧记录。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT * FROM moisture_measurements
+               WHERE material_id = ? AND lot = ? AND sample_mass_g = ?
+                 AND dried_mass_g = ? AND valid_from = ? AND valid_to = ?""",
+            (material_id, lot, sample_mass_g, dried_mass_g, valid_from, valid_to),
+        ).fetchone()
+        if existing is not None:
+            return _moisture_row_to_dict(existing)
+        cur = conn.execute(
+            """INSERT INTO moisture_measurements
+                   (material_id, lot, sample_mass_g, dried_mass_g, moisture_pct,
+                    valid_from, valid_to, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                material_id, lot, sample_mass_g, dried_mass_g, moisture_pct,
+                valid_from, valid_to, note,
+            ),
+        )
+        new_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM moisture_measurements WHERE id = ?", (new_id,)
+        ).fetchone()
+    return _moisture_row_to_dict(row)
+
+
+def get_effective_moisture(
+    material_id: int, lot: str, as_of: str
+) -> Optional[dict[str, Any]]:
+    """取某原料某批号在基准日生效（闭区间包含该日）的测定；无则返回 None。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT * FROM moisture_measurements
+               WHERE material_id = ? AND lot = ?
+                 AND valid_from <= ? AND valid_to >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (material_id, lot, as_of, as_of),
+        ).fetchone()
+    return _moisture_row_to_dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
 # 配方版本（不可变）
 # ---------------------------------------------------------------------------
 
@@ -290,6 +420,7 @@ def save_version(
     constraints: dict[str, Any],
     result: dict[str, Any],
     constants: Optional[dict[str, Any]] = None,
+    moisture_plan: Optional[dict[str, Any]] = None,
 ) -> tuple[Any, bool]:
     """写入不可变版本；同 hash 已存在则直接返回旧记录（幂等）。
 
@@ -305,8 +436,9 @@ def save_version(
         conn.execute(
             """INSERT INTO recipe_versions
                    (id, input_hash, items, note, material_snapshot,
-                    constraints, constants_version, constants_snapshot, result)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    constraints, constants_version, constants_snapshot,
+                    moisture_plan, result)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 input_hash,
                 input_hash,
@@ -316,6 +448,9 @@ def save_version(
                 json.dumps(constraints, sort_keys=True),
                 CONSTANTS_VERSION,
                 json.dumps(constants, sort_keys=True),
+                json.dumps(moisture_plan, sort_keys=True, ensure_ascii=False)
+                if moisture_plan is not None
+                else None,
                 json.dumps(result, sort_keys=True),
             ),
         )
@@ -354,6 +489,9 @@ def _version_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     else:
         # 旧库（迁移前创建的版本）：用当前常量补齐，保证读取结构一致
         data["constants_snapshot"] = constants_snapshot()
+    # 旧版本（含水功能上线前冻结）无称量方案：显式按干料，绝不暗用现值
+    plan_raw = data.get("moisture_plan")
+    data["moisture_plan"] = json.loads(plan_raw) if plan_raw else None
     return data
 
 

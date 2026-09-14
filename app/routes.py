@@ -16,6 +16,7 @@ from .schemas import (
     MasterPlanRequest,
     MaterialCreate,
     MaterialUpdate,
+    MoistureMeasurementCreate,
     RobustFreezeRequest,
     RobustSearchRequest,
     SearchRequest,
@@ -85,6 +86,36 @@ def remove_material(material_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 原料含水测定（不可变）
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/materials/{material_id}/moisture-measurements", status_code=201
+)
+def create_moisture_measurement(
+    material_id: int, payload: MoistureMeasurementCreate
+) -> dict[str, Any]:
+    """为原料登记一条不可变含水测定（湿基含水率由取样/烘干质量计算）。"""
+    return service.create_moisture_measurement(material_id, payload)
+
+
+@router.get("/materials/{material_id}/moisture-measurements")
+def list_material_moisture(
+    material_id: int, lot: str | None = Query(default=None)
+) -> list[dict]:
+    db.get_material(material_id)  # 404: 原料不存在
+    return service.list_moisture_measurements(material_id=material_id, lot=lot)
+
+
+@router.get("/moisture-measurements")
+def list_all_moisture(
+    material_id: int | None = Query(default=None),
+    lot: str | None = Query(default=None),
+) -> list[dict]:
+    return service.list_moisture_measurements(material_id=material_id, lot=lot)
+
+
+# ---------------------------------------------------------------------------
 # 直接计算 / 搜索
 # ---------------------------------------------------------------------------
 
@@ -121,7 +152,18 @@ def freeze_version(payload: dict) -> dict[str, Any]:
             "冻结请求校验失败", "validation_failed", exc.errors()
         )
     constraints = payload.get("search_constraints")
-    stored, created = service.freeze_version(req, constraints)
+    # 支持客户端把搜索返回的批号选择直接放在顶层 {"lots": ..., "moisture_as_of": ...}
+    lots = None
+    raw_lots = payload.get("lots")
+    if isinstance(raw_lots, dict):
+        lots = {int(k): str(v) for k, v in raw_lots.items() if v}
+    as_of = payload.get("moisture_as_of")
+    from datetime import date as _date
+
+    moisture_as_of = _date.fromisoformat(as_of) if as_of else None
+    stored, created = service.freeze_version(
+        req, constraints, lots=lots, moisture_as_of=moisture_as_of
+    )
     return {"created": created, "version": stored}
 
 

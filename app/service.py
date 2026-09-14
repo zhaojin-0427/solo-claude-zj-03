@@ -4,11 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from typing import Any
+from datetime import date
+from typing import Any, Optional
 
 import numpy as np
 
-from . import blending, db, optimizer, slurry, variability
+from . import blending, db, moisture, optimizer, slurry, variability
 from .chemistry import calc_batch, deviation_summary, validate_analysis
 from .config import (
     CONSTANTS_VERSION,
@@ -23,6 +24,7 @@ from .schemas import (
     FreezeRequest,
     MasterPlanRequest,
     MaterialCreate,
+    MoistureMeasurementCreate,
     OxideTarget,
     RobustFreezeRequest,
     RobustSearchRequest,
@@ -55,6 +57,107 @@ def update_material(material_id: int, payload):
 
 
 # ---------------------------------------------------------------------------
+# 原料含水测定
+# ---------------------------------------------------------------------------
+
+def _as_of_str(as_of: Optional[date]) -> str:
+    return (as_of or date.today()).isoformat()
+
+
+def create_moisture_measurement(
+    material_id: int, payload: MoistureMeasurementCreate
+) -> dict[str, Any]:
+    """登记不可变含水测定：湿基含水率由 Python 计算，区间重叠在此拒绝。"""
+    db.get_material(material_id)  # 404: 原料不存在
+    valid_from = payload.valid_from.isoformat()
+    valid_to = payload.valid_to.isoformat()
+    overlap = db.find_overlapping_moisture(
+        material_id, payload.lot, valid_from, valid_to
+    )
+    if overlap is not None:
+        raise GlazeError(
+            f"原料 {material_id} 批号「{payload.lot}」在 "
+            f"{overlap['valid_from']}~{overlap['valid_to']} 已有生效测定，"
+            f"新区间 {valid_from}~{valid_to} 与之重叠",
+            "moisture_interval_overlap",
+            {
+                "material_id": material_id,
+                "lot": payload.lot,
+                "new_interval": [valid_from, valid_to],
+                "existing": {
+                    "id": overlap["id"],
+                    "interval": [overlap["valid_from"], overlap["valid_to"]],
+                },
+            },
+        )
+    fraction = moisture.wet_basis_fraction(
+        payload.sample_mass_g, payload.dried_mass_g
+    )
+    rec = db.create_moisture_measurement(
+        material_id=material_id,
+        lot=payload.lot,
+        sample_mass_g=payload.sample_mass_g,
+        dried_mass_g=payload.dried_mass_g,
+        moisture_pct=fraction * 100.0,
+        valid_from=valid_from,
+        valid_to=valid_to,
+        note=payload.note,
+    )
+    return rec
+
+
+def list_moisture_measurements(
+    material_id: Optional[int] = None, lot: Optional[str] = None
+) -> list[dict[str, Any]]:
+    return db.list_moisture_measurements(material_id=material_id, lot=lot)
+
+
+def _build_weighing_plan(
+    dry_items: list[tuple[int, float]],
+    materials: dict,
+    selected_lots: dict[int, str],
+    as_of: Optional[date],
+) -> dict[str, Any]:
+    """按干料需求与批号选择，构造现场湿料称量方案。
+
+    未选择批号或批号在基准日无有效测定时，对应原料显式回退按干料称量。
+    """
+    as_of_str = _as_of_str(as_of)
+    # 与 calc_batch 一致：同一原料多次出现时按干料量合并
+    merged: dict[int, float] = {}
+    for mid, dry_kg in dry_items:
+        merged[mid] = merged.get(mid, 0.0) + dry_kg
+    lines: list[dict[str, Any]] = []
+    for mid, dry_kg in merged.items():
+        mat = materials.get(mid)
+        if mat is None:
+            from .errors import NotFoundError
+
+            raise NotFoundError(
+                f"原料不存在: id={mid}", "material_not_found"
+            )
+        lot = selected_lots.get(mid)
+        measurement = None
+        if lot is not None:
+            measurement = db.get_effective_moisture(mid, lot, as_of_str)
+        lines.append(
+            moisture.weighing_line(
+                material_id=mid,
+                name=mat.name,
+                dry_kg=dry_kg,
+                price_per_kg=mat.price,
+                available_kg=mat.available,
+                lot=lot,
+                as_of=as_of_str,
+                measurement=measurement,
+            )
+        )
+    return moisture.summarize_weighing(
+        lines, selected_lots=selected_lots, as_of=as_of_str
+    )
+
+
+# ---------------------------------------------------------------------------
 # 直接按投料量计算
 # ---------------------------------------------------------------------------
 
@@ -78,7 +181,13 @@ def compute_batch(req: BatchRequest) -> dict[str, Any]:
     ids = [i.material_id for i in req.items]
     materials = db.get_materials_map(ids)
     tuples = _material_tuples(materials, req.items)
-    return calc_batch(tuples, targets={})
+    result = calc_batch(tuples, targets={})
+    # 化学分析仍按干料；另附按批号换算的现场湿料称量方案
+    dry_items = [(i.material_id, i.amount) for i in req.items if i.amount > 0]
+    result["moisture"] = _build_weighing_plan(
+        dry_items, materials, dict(req.lots), req.moisture_as_of
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +214,7 @@ def _snapshot_materials(materials: dict) -> dict[str, Any]:
 
 
 def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
-            materials: dict) -> dict[str, Any]:
+            materials: dict, plan_factory) -> dict[str, Any]:
     amounts = sol["amounts"]
     tuples = []
     items_payload = []
@@ -119,6 +228,10 @@ def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
     result = calc_batch(tuples, targets={o: req.targets[o] for o in req.targets})
     summary = deviation_summary(result, req.targets)
     target_results = summary["per_oxide"]
+    # 现场湿料称量方案：仅对实际入选的原料构造
+    wet_plan = plan_factory(
+        [(p["material_id"], p["amount"]) for p in items_payload]
+    )
     return {
         "items": items_payload,
         "n_materials": int(sol["used"].sum()),
@@ -129,6 +242,7 @@ def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
         "batch_mass": result["batch_mass"],
         "batch_error": round(result["batch_mass"] - req.batch_size, 9),
         "cost": round(result["cost"], 6),
+        "cost_wet": wet_plan["totals"]["cost"],
         "loss_on_ignition": round(result["loss_on_ignition"], 9),
         "loss_on_ignition_pct": round(result["loss_on_ignition_pct"], 6),
         "seger": result["seger"],
@@ -137,8 +251,44 @@ def _assess(prob: optimizer.Problem, sol: dict, req: SearchRequest,
         "flux_moles": result["flux_moles"],
         "fired_mass": round(result["fired_mass"], 9),
         "breakdown": result["breakdown"],
+        "moisture": wet_plan,
         "all_targets_met": summary["n_violations"] == 0,
     }
+
+
+def _moisture_effective_map(req: SearchRequest, as_of_str: str) -> dict[int, dict]:
+    """解析搜索中各选批原料的生效测定（无有效测定则不进入该映射）。"""
+    effective: dict[int, dict] = {}
+    for mid, lot in req.lots.items():
+        rec = db.get_effective_moisture(mid, lot, as_of_str)
+        if rec is not None:
+            effective[mid] = rec
+    return effective
+
+
+def _scale_materials_for_moisture(
+    all_materials: dict[int, Any],
+    effective: dict[int, dict],
+) -> dict[int, Any]:
+    """把已解析含水批号的原料库存/单价换算为干基等效，供优化器做库存与成本决策。
+
+    优化器的决策变量仍是干料 kg：库存可用干料 = 湿库存*(1-w)，
+    每 kg 干料的获取成本 = 单价/(1-w)。化学分析不变。
+    """
+    scaled: dict[int, Any] = {}
+    for mid, mat in all_materials.items():
+        rec = effective.get(mid)
+        if rec is None:
+            scaled[mid] = mat
+            continue
+        dry_factor = 1.0 - rec["moisture_fraction"]
+        scaled[mid] = mat.model_copy(
+            update={
+                "available": mat.available * dry_factor,
+                "price": mat.price / dry_factor,
+            }
+        )
+    return scaled
 
 
 def search_recipes(req: SearchRequest) -> dict[str, Any]:
@@ -150,7 +300,18 @@ def search_recipes(req: SearchRequest) -> dict[str, Any]:
 
 def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
     all_materials = {m.id: m for m in db.list_materials()}
-    mats = optimizer.prepare_materials(all_materials, req)
+    # 引用了不存在原料的批号选择 -> 404 语义（prepare_materials 只看约束）
+    unknown_lots = sorted(mid for mid in req.lots if mid not in all_materials)
+    if unknown_lots:
+        from .errors import NotFoundError
+
+        raise NotFoundError(
+            f"批号选择引用了不存在的原料: id={unknown_lots}", "material_not_found"
+        )
+    as_of_str = _as_of_str(req.moisture_as_of)
+    effective = _moisture_effective_map(req, as_of_str)
+    scaled_materials = _scale_materials_for_moisture(all_materials, effective)
+    mats = optimizer.prepare_materials(scaled_materials, req)
     targets = optimizer.build_targets(req)
 
     batch_lo = req.batch_size - (
@@ -169,6 +330,11 @@ def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
         batch_hi=batch_hi,
     )
 
+    def plan_factory(dry_items: list[tuple[int, float]]) -> dict[str, Any]:
+        return _build_weighing_plan(
+            dry_items, all_materials, dict(req.lots), req.moisture_as_of
+        )
+
     status = "optimal"
     diagnosis = None
     candidates: list[dict[str, Any]] = []
@@ -179,7 +345,7 @@ def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
         status = "infeasible"
         diagnosis = optimizer.diagnose(prob)
     else:
-        assessed = _assess(prob, primary, req, all_materials)
+        assessed = _assess(prob, primary, req, all_materials, plan_factory)
         candidates.append(assessed)
         if not assessed["all_targets_met"]:
             status = "target_unreachable"
@@ -194,7 +360,7 @@ def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
             alt = optimizer.lexicographic_search(prob, cuts=list(seen_cuts))
             if alt is None:
                 break
-            alt_assessed = _assess(prob, alt, req, all_materials)
+            alt_assessed = _assess(prob, alt, req, all_materials, plan_factory)
             candidates.append(alt_assessed)
             seen_cuts.append(alt["used"].astype(float))
 
@@ -205,6 +371,21 @@ def _search_recipes_impl(req: SearchRequest) -> dict[str, Any]:
         "batch_size": req.batch_size,
         "step": req.step,
         "batch_interval": [batch_lo, batch_hi],
+        "moisture": {
+            "as_of": as_of_str,
+            "selected_lots": {str(mid): lot for mid, lot in sorted(req.lots.items())},
+            "resolved_lots": sorted(effective),
+            "unresolved": [
+                {
+                    "material_id": mid,
+                    "lot": lot,
+                    "reason": moisture.NO_EFFECTIVE_MEASUREMENT,
+                    "note": moisture.DRY_NOTES[moisture.NO_EFFECTIVE_MEASUREMENT],
+                }
+                for mid, lot in sorted(req.lots.items())
+                if mid not in effective
+            ],
+        },
         "candidates": candidates,
         "best": candidates[0] if candidates else None,
         "diagnosis": diagnosis,
@@ -225,7 +406,7 @@ def _rank_candidates(candidates: list[dict], batch_size: float) -> list[dict]:
             c["n_violations"],
             c["weighted_deviation"],
             c["n_materials"],
-            round(c["cost"], 9),
+            round(c.get("cost_wet", c["cost"]), 9),
             abs(c["batch_mass"] - batch_size),
         ),
     )
@@ -242,8 +423,19 @@ def _canonical_hash(payload: Any) -> str:
     return hashlib.sha256(blob).hexdigest()[:32]
 
 
-def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
-    """冻结投料方案：重算并把原料分析、约束、常量、输入哈希整体存档。"""
+def freeze_version(
+    req: FreezeRequest,
+    search_constraints: dict | None = None,
+    lots: dict[int, str] | None = None,
+    moisture_as_of: Optional[date] = None,
+):
+    """冻结投料方案：重算并把原料分析、约束、常量、输入哈希整体存档。
+
+    ``lots`` / ``moisture_as_of`` 显式给出时优先于请求体内字段
+    （用于把搜索返回的批号选择连同候选一起冻结）。批号选择不为空时，
+    冻结时的湿料称量方案一并存档，日后新建釉浆批次凭它扣除原料自带水；
+    测定随后更新也不影响已冻结版本。
+    """
     ids = [i.material_id for i in req.items]
     materials = db.get_materials_map(ids)
     tuples = _material_tuples(materials, req.items)
@@ -264,6 +456,28 @@ def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
         constraints["items"] = sorted(
             constraints["items"], key=lambda x: x["material_id"]
         )
+
+    selected_lots: dict[int, str] = {}
+    if lots:
+        selected_lots.update(lots)
+    if req.lots:
+        selected_lots.update(req.lots)
+    as_of = moisture_as_of if moisture_as_of is not None else req.moisture_as_of
+    # 约束（搜索快照）里的批号选择仅在显式参数缺省时兜底
+    if not selected_lots and isinstance(constraints, dict):
+        raw_lots = constraints.get("lots")
+        if isinstance(raw_lots, dict):
+            selected_lots = {int(k): str(v) for k, v in raw_lots.items() if v}
+        if as_of is None and constraints.get("moisture_as_of"):
+            as_of = date.fromisoformat(constraints["moisture_as_of"])
+
+    dry_items = [
+        (i.material_id, i.amount) for i in req.items if i.amount > 0.0
+    ]
+    moisture_plan = _build_weighing_plan(
+        dry_items, materials, selected_lots, as_of
+    )
+
     constants = constants_snapshot()
     hash_payload = {
         "items": canonical_items,
@@ -271,6 +485,10 @@ def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
         "constraints": constraints,
         "constants": constants,
     }
+    if selected_lots:
+        hash_payload["moisture_plan"] = json.loads(
+            json.dumps(moisture_plan, sort_keys=True, ensure_ascii=False)
+        )
     input_hash = _canonical_hash(hash_payload)
 
     stored, created = db.save_version(
@@ -281,6 +499,7 @@ def freeze_version(req: FreezeRequest, search_constraints: dict | None = None):
         constraints=constraints,
         result=result,
         constants=constants,
+        moisture_plan=moisture_plan if selected_lots else None,
     )
     return stored, created
 
@@ -835,7 +1054,12 @@ def freeze_blend_plan(experiment_id: str, req: BlendFreezeRequest):
 
 
 def _slurry_recipe_snapshot(version: dict) -> dict[str, Any]:
-    """从冻结版本提取釉浆批次需要的配方快照：份额 + 原料名。"""
+    """从冻结版本提取釉浆批次需要的配方快照：份额 + 原料名 + 冻结含水方案。
+
+    称量方案取自版本冻结时存档的 moisture_plan；版本没有批号方案
+    （旧版本或未指定批号冻结）时各料按干料称量。快照是不可变副本，
+    之后新增/修订含水测定不会影响已建批次。
+    """
     totals: dict[int, float] = {}
     for item in version["items"]:
         amt = float(item["amount"])
@@ -845,18 +1069,37 @@ def _slurry_recipe_snapshot(version: dict) -> dict[str, Any]:
     batch_mass = sum(totals.values())
     if batch_mass <= 0.0:
         raise GlazeError("来源配方没有任何正用量原料", "empty_batch")
+    plan = version.get("moisture_plan")
+    wet_lines = (
+        {int(line["material_id"]): line for line in plan.get("lines", [])}
+        if plan
+        else {}
+    )
     materials = []
     for mid in sorted(totals):
         name = version["material_snapshot"][str(mid)]["name"]
+        line = wet_lines.get(mid)
         materials.append(
             {
                 "material_id": mid,
                 "name": name,
                 "amount_kg": round(totals[mid], 9),
                 "share": totals[mid] / batch_mass,
+                "lot": line.get("lot") if line else None,
+                "weighing_basis": line.get("basis", "dry") if line else "dry",
+                "moisture_fraction": line.get("moisture_fraction") if line else None,
+                "moisture_measurement_id": (
+                    line["measurement"]["id"]
+                    if line and line.get("measurement")
+                    else None
+                ),
             }
         )
-    return {"version_id": version["id"], "materials": materials}
+    return {
+        "version_id": version["id"],
+        "materials": materials,
+        "moisture_plan": plan,
+    }
 
 
 def _initial_plan(
@@ -865,14 +1108,16 @@ def _initial_plan(
     """按配方份额给各原料、初始用水、添加剂的初始称量值。
 
     固含率定义 S = 干物 / (干物 + 水 + 添加剂)，初始取水取目标区间中点，
-    再按添加剂占干料比例反推初始用水。
+    再按添加剂占干料比例反推初始总用水。湿料原料自带水从初始加水中
+    扣除：现场称湿料，净加水 = 总用水 - 原料带入水；带入水超过总用水
+    时明确指出超量原料并拒绝创建。
     """
     target_solids = (req.solids_low + req.solids_high) / 2.0
     dry_g = req.target_dry_mass_kg * 1000.0
     additive_g = dry_g * req.additive_ratio
     # dry / (dry + water + additive) = S  =>  water = dry/S - dry - additive
-    water_g = dry_g / target_solids - dry_g - additive_g
-    if water_g < -1e-9:
+    total_water_g = dry_g / target_solids - dry_g - additive_g
+    if total_water_g < -1e-9:
         raise GlazeError(
             "按目标固含率与添加剂比例反推的初始用水为负：添加剂占比过高，"
             f"目标固含率 {target_solids:.4f} 无法同时容纳 {req.additive_ratio:.4f} "
@@ -883,29 +1128,87 @@ def _initial_plan(
                 "additive_ratio": req.additive_ratio,
             },
         )
-    water_g = max(water_g, 0.0)
+    total_water_g = max(total_water_g, 0.0)
+
     lines = []
+    carried_water_g = 0.0
+    wet_total_g = 0.0
     for m in recipe["materials"]:
-        mass_g = dry_g * m["share"]
+        mass_g = dry_g * m["share"]  # 需要的干料
+        w = m.get("moisture_fraction")
+        if m.get("weighing_basis") == "wet" and w is not None:
+            wet_mass_g = moisture.wet_for_dry(mass_g, w)
+            water_g = moisture.carried_water(wet_mass_g, mass_g)
+            basis = "wet"
+        else:
+            wet_mass_g = mass_g
+            water_g = 0.0
+            basis = "dry"
+        carried_water_g += water_g
+        wet_total_g += wet_mass_g
         lines.append(
             {
                 "material_id": m["material_id"],
                 "name": m["name"],
+                "lot": m.get("lot"),
                 "share": m["share"],
+                "weighing_basis": basis,
+                "moisture_fraction": w,
                 "mass_kg": round(mass_g / 1000.0, 9),
                 "mass_g": round(mass_g, 6),
+                "wet_mass_g": round(wet_mass_g, 6),
+                "wet_mass_kg": round(wet_mass_g / 1000.0, 9),
+                "carried_water_g": round(water_g, 6),
             }
         )
+
+    net_water_g = total_water_g - carried_water_g
+    if net_water_g < -1e-9:
+        excess = round(-net_water_g, 6)
+        contributors = sorted(
+            (
+                {
+                    "material_id": line["material_id"],
+                    "name": line["name"],
+                    "lot": line["lot"],
+                    "moisture_fraction": line["moisture_fraction"],
+                    "carried_water_g": line["carried_water_g"],
+                }
+                for line in lines
+                if line["carried_water_g"] > 0.0
+            ),
+            key=lambda d: -d["carried_water_g"],
+        )
+        raise GlazeError(
+            f"湿料原料自带水合计 {carried_water_g:.1f} g 已超过目标固含率反推的"
+            f"初始总用水 {total_water_g:.1f} g（超量 {excess:.1f} g），"
+            "无法靠减少加水满足固含率，请放宽目标固含率或改用更干批号",
+            "moisture_water_exceeds_plan",
+            {
+                "target_solids_fraction": target_solids,
+                "initial_total_water_g": round(total_water_g, 6),
+                "carried_water_g": round(carried_water_g, 6),
+                "excess_water_g": excess,
+                "contributors": contributors,
+            },
+        )
+
+    # 体积口径：干料粉体 + 总液相（净加水 + 原料带入水 + 添加剂）
     volume_ml = (
         dry_g / req.powder_true_density_kg_l
-        + (water_g + additive_g) / rho_w
+        + (total_water_g + additive_g) / rho_w
     )
     return {
         "target_solids_fraction": target_solids,
         "target_dry_mass_g": dry_g,
         "materials": lines,
-        "initial_water_g": round(water_g, 6),
-        "initial_water_kg": round(water_g / 1000.0, 9),
+        "initial_water_g": round(net_water_g, 6),
+        "initial_water_kg": round(net_water_g / 1000.0, 9),
+        "carried_water_g": round(carried_water_g, 6),
+        "carried_water_kg": round(carried_water_g / 1000.0, 9),
+        "initial_total_water_g": round(total_water_g, 6),
+        "weighed_wet_mass_g": round(wet_total_g, 6),
+        "weighed_wet_mass_kg": round(wet_total_g / 1000.0, 9),
         "initial_additive_g": round(additive_g, 6),
         "initial_additive_kg": round(additive_g / 1000.0, 9),
         "planned_volume_ml": round(volume_ml, 6),

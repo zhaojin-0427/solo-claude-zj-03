@@ -1,6 +1,7 @@
 """Pydantic 数据模型：原料、计算请求、搜索请求、响应结构。"""
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -128,16 +129,91 @@ class Material(MaterialBase):
 
 
 # ---------------------------------------------------------------------------
+# 原料含水测定（不可变版本）
+# ---------------------------------------------------------------------------
+
+class MoistureMeasurementCreate(BaseModel):
+    """单批原料的含水测定：取样质量、烘干后质量与生效区间。
+
+    湿基含水率由服务端按 ``(取样 - 烘干)/取样`` 计算，调用方不得直接给值。
+    """
+
+    lot: str = Field(..., min_length=1, max_length=64, description="适用批号")
+    sample_mass_g: float = Field(..., gt=0.0, description="取样（湿料）质量（g）")
+    dried_mass_g: float = Field(..., gt=0.0, description="烘干后质量（g）")
+    valid_from: date = Field(..., description="生效起始日（含）")
+    valid_to: date = Field(..., description="生效截止日（含）")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_measurement(self) -> "MoistureMeasurementCreate":
+        if not self.lot.strip():
+            raise GlazeError(
+                "适用批号不得为空白",
+                "moisture_lot_missing",
+            )
+        self.lot = self.lot.strip()
+        if self.dried_mass_g > self.sample_mass_g + 1e-12:
+            raise GlazeError(
+                f"烘干后质量 {self.dried_mass_g} g 大于取样质量 "
+                f"{self.sample_mass_g} g，质量倒置",
+                "moisture_mass_inverted",
+                {
+                    "sample_mass_g": self.sample_mass_g,
+                    "dried_mass_g": self.dried_mass_g,
+                },
+            )
+        if self.valid_to < self.valid_from:
+            raise GlazeError(
+                f"生效区间倒置: {self.valid_from} 晚于 {self.valid_to}",
+                "moisture_interval_inverted",
+                {"valid_from": str(self.valid_from), "valid_to": str(self.valid_to)},
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # 直接计算
 # ---------------------------------------------------------------------------
 
 class BatchItem(BaseModel):
     material_id: int
-    amount: float = Field(..., ge=0.0, description="投料量（kg），不允许为负")
+    amount: float = Field(..., ge=0.0, description="干料投料量（kg），不允许为负")
+
+
+def _check_lots(lots: dict[int, str]) -> dict[int, str]:
+    blank = sorted(mid for mid, lot in lots.items() if not lot or not lot.strip())
+    if blank:
+        raise GlazeError(
+            f"以下原料的批号为空: {blank}，批号缺失时应省略该原料而非给空串",
+            "moisture_lot_missing",
+            {"material_ids": blank},
+        )
+    return {mid: lot.strip() for mid, lot in lots.items()}
 
 
 class BatchRequest(BaseModel):
     items: list[BatchItem] = Field(min_length=1)
+    lots: dict[int, str] = Field(
+        default_factory=dict,
+        description="各原料选用的到货批号；未列出的原料按干料称量并显式标注",
+    )
+    moisture_as_of: Optional[date] = Field(
+        default=None, description="含水测定生效基准日（默认今天）"
+    )
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "BatchRequest":
+        self.lots = _check_lots(self.lots)
+        item_ids = {i.material_id for i in self.items}
+        outsiders = sorted(set(self.lots) - item_ids)
+        if outsiders:
+            raise GlazeError(
+                f"批号选择引用了投料表之外的原料: {outsiders}",
+                "moisture_lot_not_in_items",
+                {"material_ids": outsiders},
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +278,13 @@ class SearchRequest(BaseModel):
     locked: dict[int, float] = Field(
         default_factory=dict, description="锁定用量（kg），必须为 step 的整数倍"
     )
+    lots: dict[int, str] = Field(
+        default_factory=dict,
+        description="各原料选用的到货批号；未列出或无有效测定的原料按干料称量并标注",
+    )
+    moisture_as_of: Optional[date] = Field(
+        default=None, description="含水测定生效基准日（默认今天）"
+    )
 
     @model_validator(mode="after")
     def _check_request(self) -> "SearchRequest":
@@ -212,6 +295,14 @@ class SearchRequest(BaseModel):
                 "unknown_oxide",
                 {"unknown": unknown},
             )
+        blank = sorted(mid for mid, lot in self.lots.items() if not lot or not lot.strip())
+        if blank:
+            raise GlazeError(
+                f"以下原料的批号为空: {blank}，批号缺失时应省略该原料而非给空串",
+                "moisture_lot_missing",
+                {"material_ids": blank},
+            )
+        self.lots = {mid: lot.strip() for mid, lot in self.lots.items()}
         overlap = sorted(set(self.required) & set(self.forbidden))
         if overlap:
             raise GlazeError(
@@ -273,6 +364,37 @@ class FreezeItem(BaseModel):
 class FreezeRequest(BaseModel):
     items: list[FreezeItem] = Field(min_length=1)
     note: Optional[str] = None
+    lots: Optional[dict[int, str]] = Field(
+        default=None,
+        description="各原料选用的到货批号；给出时把湿料称量方案一并冻结进版本",
+    )
+    moisture_as_of: Optional[date] = Field(
+        default=None, description="含水测定生效基准日（默认今天）"
+    )
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "FreezeRequest":
+        if self.lots is None:
+            return self
+        blank = sorted(
+            mid for mid, lot in self.lots.items() if not lot or not lot.strip()
+        )
+        if blank:
+            raise GlazeError(
+                f"以下原料的批号为空: {blank}，批号缺失时应省略该原料而非给空串",
+                "moisture_lot_missing",
+                {"material_ids": blank},
+            )
+        self.lots = {mid: lot.strip() for mid, lot in self.lots.items()}
+        item_ids = {i.material_id for i in self.items}
+        outsiders = sorted(set(self.lots) - item_ids)
+        if outsiders:
+            raise GlazeError(
+                f"批号选择引用了投料表之外的原料: {outsiders}",
+                "moisture_lot_not_in_items",
+                {"material_ids": outsiders},
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
