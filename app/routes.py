@@ -12,6 +12,14 @@ from .schemas import (
     BatchRequest,
     BlendExperimentRequest,
     BlendFreezeRequest,
+    ExpansionAnalysisParams,
+    ExpansionCopyRequest,
+    ExpansionCurveInput,
+    ExpansionExclusionCreate,
+    ExpansionFinalizeRequest,
+    ExpansionRankRequest,
+    ExpansionRecipeCreate,
+    ExpansionStudyCreate,
     FiringCopyRequest,
     FiringFinalizeRequest,
     FiringFitRequest,
@@ -443,3 +451,129 @@ def get_firing_freeze(freeze_id: str) -> dict[str, Any]:
 @router.get("/firing-result-freezes/{freeze_id}")
 def get_firing_result_freeze(freeze_id: str) -> dict[str, Any]:
     return db.get_firing_result_freeze(freeze_id)
+
+
+# ---------------------------------------------------------------------------
+# 釉坯热膨胀适配研究（草稿 -> 定稿只读 -> 复制新版补测；分析/排列/比较）
+# ---------------------------------------------------------------------------
+
+@router.post("/expansion-studies", status_code=201)
+def create_expansion_study(req: ExpansionStudyCreate) -> dict[str, Any]:
+    """以一个坯体型号和弹性/几何参数创建热膨胀适配研究（草稿）。"""
+    return service.create_expansion_study(req)
+
+
+@router.get("/expansion-studies")
+def list_expansion_studies(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    return [service.assemble_expansion_study(s) for s in db.list_expansion_studies(limit)]
+
+
+@router.get("/expansion-studies/{study_id}")
+def get_expansion_study(study_id: str) -> dict[str, Any]:
+    return service.assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+@router.post("/expansion-studies/{study_id}/body-curves", status_code=201)
+def add_expansion_body_curve(
+    study_id: str, req: ExpansionCurveInput
+) -> dict[str, Any]:
+    """登记一条坯条膨胀曲线（重复测次+升降温方向；同测次同值幂等）。"""
+    return service.add_expansion_body_curve(study_id, req)
+
+
+@router.delete("/expansion-studies/{study_id}/body-curves/{curve_id}")
+def remove_expansion_body_curve(study_id: str, curve_id: int) -> dict[str, Any]:
+    """从草稿研究删除一条坯条曲线。"""
+    return service.delete_expansion_body_curve(study_id, curve_id)
+
+
+@router.post("/expansion-studies/{study_id}/recipes", status_code=201)
+def add_expansion_recipe(
+    study_id: str, req: ExpansionRecipeCreate
+) -> dict[str, Any]:
+    """登记一份冻结配方（1~20 份）及其同批釉条膨胀曲线。"""
+    return service.add_expansion_recipe(study_id, req)
+
+
+@router.delete("/expansion-studies/{study_id}/recipes/{recipe_index}")
+def remove_expansion_recipe(study_id: str, recipe_index: int) -> dict[str, Any]:
+    """从草稿研究删除一份配方及其釉条曲线。"""
+    return service.delete_expansion_recipe(study_id, recipe_index)
+
+
+@router.post(
+    "/expansion-studies/{study_id}/recipes/{recipe_index}/curves", status_code=201
+)
+def add_expansion_glaze_curve(
+    study_id: str, recipe_index: int, req: ExpansionCurveInput
+) -> dict[str, Any]:
+    """向既有配方补登一条釉条曲线（补测；同测次同值幂等）。"""
+    return service.add_expansion_glaze_curve(study_id, recipe_index, req)
+
+
+@router.delete("/expansion-studies/{study_id}/recipes/{recipe_index}/curves/{curve_id}")
+def remove_expansion_glaze_curve(
+    study_id: str, recipe_index: int, curve_id: int
+) -> dict[str, Any]:
+    """从草稿研究的配方删除一条釉条曲线。"""
+    return service.delete_expansion_glaze_curve(study_id, recipe_index, curve_id)
+
+
+@router.post("/expansion-studies/{study_id}/exclusions", status_code=201)
+def add_expansion_exclusion(
+    study_id: str, req: ExpansionExclusionCreate
+) -> dict[str, Any]:
+    """注明原因排除一个异常测次（坯条或某配方的釉条）。"""
+    return service.add_expansion_exclusion(study_id, req)
+
+
+@router.delete("/expansion-studies/{study_id}/exclusions/{exclusion_id}")
+def remove_expansion_exclusion(study_id: str, exclusion_id: int) -> dict[str, Any]:
+    """从草稿研究删除一条测次排除记录。"""
+    return service.delete_expansion_exclusion(study_id, exclusion_id)
+
+
+@router.post("/expansion-studies/{study_id}/analyze")
+def analyze_expansion_study(
+    study_id: str, req: ExpansionAnalysisParams
+) -> dict[str, Any]:
+    """插值重复曲线、在共同温区积分釉坯膨胀差（只读计算）。"""
+    return service.analyze_expansion_study(study_id, req)
+
+
+@router.post("/expansion-studies/{study_id}/rank")
+def rank_expansion_recipes(
+    study_id: str, req: ExpansionRankRequest
+) -> dict[str, Any]:
+    """按目标应力窗、最坏区间和不确定度排列配方（只读计算）。"""
+    return service.rank_expansion_recipes(study_id, req)
+
+
+@router.post("/expansion-studies/{study_id}/finalize", status_code=201)
+def finalize_expansion_study(
+    study_id: str, req: ExpansionFinalizeRequest | None = None
+) -> dict[str, Any]:
+    """定稿冻结原始曲线、来源配方与计算参数；重复定稿返回同一结果。"""
+    payload = req if req is not None else ExpansionFinalizeRequest.model_validate({})
+    stored, created = service.finalize_expansion_study(study_id, payload)
+    return {"created": created, "freeze": stored}
+
+
+@router.post("/expansion-studies/{study_id}/copy", status_code=201)
+def copy_expansion_study(
+    study_id: str, req: ExpansionCopyRequest | None = None
+) -> dict[str, Any]:
+    """把已定稿研究复制为新版本草稿（补测用），版本号在谱系内递增。"""
+    payload = req if req is not None else ExpansionCopyRequest.model_validate({})
+    return service.copy_expansion_study(study_id, payload)
+
+
+@router.get("/expansion-studies/{study_id}/compare/{other_id}")
+def compare_expansion_studies(study_id: str, other_id: str) -> dict[str, Any]:
+    """比较两个已定稿研究的冻结结果（共有配方逐份给出变化）。"""
+    return service.compare_expansion_studies(study_id, other_id)
+
+
+@router.get("/expansion-freezes/{freeze_id}")
+def get_expansion_freeze(freeze_id: str) -> dict[str, Any]:
+    return db.get_expansion_freeze(freeze_id)

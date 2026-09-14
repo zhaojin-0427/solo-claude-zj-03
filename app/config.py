@@ -95,6 +95,14 @@ FIRING_OUTLIER_THRESHOLD = 2.5     # 异常试片判定的学生化残差阈值
 FIRING_WILSON_Z = 1.96             # 缺陷发生率 Wilson 区间 z 值（95%）
 FIRING_MAX_GRID_POINTS = 100_000   # 配比搜索网格点数上限
 
+# 釉坯热膨胀适配研究参数
+EXPANSION_MAX_RECIPES = 20         # 单个研究的冻结配方份数上限
+EXPANSION_DEFAULT_SEGMENTS = 4     # 共同温区分段线膨胀系数的默认段数
+EXPANSION_MAX_SEGMENTS = 20        # 分段数上限
+EXPANSION_ROOM_TEMP_C = 25.0       # 室温基准（残余应变积分下限）
+EXPANSION_MAX_ABS_STRAIN = 0.2     # 相对长度（无量纲应变）绝对值 sanity 上限
+EXPANSION_MIN_CURVE_POINTS = 2     # 单条曲线最少温度点数
+
 
 class Settings(BaseModel):
     db_path: str = str(Path(__file__).resolve().parent.parent / "glaze.db")

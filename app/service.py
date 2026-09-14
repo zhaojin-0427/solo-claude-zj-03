@@ -9,11 +9,12 @@ from typing import Any, Optional
 
 import numpy as np
 
-from . import blending, db, firing, moisture, optimizer, slurry, variability
+from . import blending, db, expansion, firing, moisture, optimizer, slurry, variability
 from .chemistry import calc_batch, deviation_summary, validate_analysis
 from .config import (
     CONSTANTS_VERSION,
     DENSITY_CLOSURE_TOLERANCE_G_ML,
+    EXPANSION_MAX_RECIPES,
     constants_snapshot,
 )
 from .errors import GlazeError
@@ -21,6 +22,14 @@ from .schemas import (
     BatchRequest,
     BlendExperimentRequest,
     BlendFreezeRequest,
+    ExpansionAnalysisParams,
+    ExpansionCopyRequest,
+    ExpansionCurveInput,
+    ExpansionExclusionCreate,
+    ExpansionFinalizeRequest,
+    ExpansionRankRequest,
+    ExpansionRecipeCreate,
+    ExpansionStudyCreate,
     FiringCopyRequest,
     FiringFinalizeRequest,
     FiringFitRequest,
@@ -2160,3 +2169,524 @@ def freeze_firing_result(study_id: str, req: FiringResultFreezeRequest):
         source_snapshot=source_snapshot,
     )
     return stored, created
+
+
+# ---------------------------------------------------------------------------
+# 釉坯热膨胀适配研究（草稿 -> 定稿只读 -> 复制新版补测）
+# ---------------------------------------------------------------------------
+
+def _expansion_params_dict(study: dict) -> dict[str, Any]:
+    """研究行的弹性/几何参数字典（视图与快照共用）。"""
+    return {
+        "glaze_thickness_mm": study["glaze_thickness_mm"],
+        "body_thickness_mm": study["body_thickness_mm"],
+        "glaze_elastic_modulus_gpa": study["glaze_elastic_modulus_gpa"],
+        "body_elastic_modulus_gpa": study["body_elastic_modulus_gpa"],
+        "glaze_poisson_ratio": study["glaze_poisson_ratio"],
+        "body_poisson_ratio": study["body_poisson_ratio"],
+        "stress_release_temp_c": study["stress_release_temp_c"],
+    }
+
+
+def _expansion_elastic(study: dict) -> dict[str, float]:
+    """分析计算用的弹性/几何参数（键名与 expansion.glaze_stress_mpa 对应）。"""
+    return {
+        "stress_release_temp_c": float(study["stress_release_temp_c"]),
+        "glaze_modulus_gpa": float(study["glaze_elastic_modulus_gpa"]),
+        "body_modulus_gpa": float(study["body_elastic_modulus_gpa"]),
+        "glaze_poisson": float(study["glaze_poisson_ratio"]),
+        "body_poisson": float(study["body_poisson_ratio"]),
+        "glaze_thickness_mm": float(study["glaze_thickness_mm"]),
+        "body_thickness_mm": float(study["body_thickness_mm"]),
+    }
+
+
+def assemble_expansion_study(study: dict) -> dict[str, Any]:
+    """组装研究完整视图：参数、坯条曲线、配方（含釉条曲线）与排除记录。"""
+    body_curves = db.list_expansion_body_curves(study["id"])
+    recipes = db.list_expansion_recipes(study["id"])
+    exclusions = db.list_expansion_exclusions(study["id"])
+    return {
+        "id": study["id"],
+        "body_name": study["body_name"],
+        "status": study["status"],
+        "version_no": study["version_no"],
+        "parent_id": study["parent_id"],
+        "root_id": study["root_id"],
+        "params": _expansion_params_dict(study),
+        "note": study["note"],
+        "body_curves": body_curves,
+        "n_body_curves": len(body_curves),
+        "recipes": recipes,
+        "n_recipes": len(recipes),
+        "exclusions": exclusions,
+        "n_exclusions": len(exclusions),
+        "freeze_id": study["freeze_id"],
+        "created_at": study["created_at"],
+        "updated_at": study["updated_at"],
+        "finalized_at": study["finalized_at"],
+    }
+
+
+def create_expansion_study(req: ExpansionStudyCreate) -> dict[str, Any]:
+    """创建热膨胀适配研究草稿：一个坯体型号 + 弹性/几何参数。"""
+    study_id = "tex_" + uuid.uuid4().hex
+    params = {
+        "glaze_thickness_mm": req.glaze_thickness_mm,
+        "body_thickness_mm": req.body_thickness_mm,
+        "glaze_elastic_modulus_gpa": req.glaze_elastic_modulus_gpa,
+        "body_elastic_modulus_gpa": req.body_elastic_modulus_gpa,
+        "glaze_poisson_ratio": req.glaze_poisson_ratio,
+        "body_poisson_ratio": req.body_poisson_ratio,
+        "stress_release_temp_c": req.stress_release_temp_c,
+    }
+    study = db.create_expansion_study(
+        study_id=study_id,
+        body_name=req.body_name,
+        version_no=1,
+        parent_id=None,
+        root_id=study_id,
+        params=params,
+        note=req.note,
+    )
+    return assemble_expansion_study(study)
+
+
+def _require_expansion_status(study: dict, allowed: tuple[str, ...]) -> None:
+    if study["status"] not in allowed:
+        raise GlazeError(
+            f"研究当前状态为 {study['status']}，该操作仅允许 {list(allowed)} 状态",
+            "invalid_expansion_status",
+            {"status": study["status"], "allowed": list(allowed)},
+        )
+
+
+def _normalize_curve(req: ExpansionCurveInput) -> dict[str, Any]:
+    """把登记曲线折算为无量纲应变，返回可入库的曲线字典。
+
+    温度顺序已在 Pydantic 校验中检查；此处做单位折算与应变 sanity 检查。
+    """
+    points = expansion.normalize_points(
+        [{"temp_c": p.temp_c, "strain": p.strain} for p in req.points],
+        req.strain_unit,
+    )
+    return {
+        "replicate_no": req.replicate_no,
+        "direction": req.direction,
+        "points": points,
+        "note": req.note,
+    }
+
+
+def add_expansion_body_curve(
+    study_id: str, req: ExpansionCurveInput
+) -> dict[str, Any]:
+    """登记一条坯条膨胀曲线（草稿；同测次同值幂等）。"""
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    curve = _normalize_curve(req)
+    db.add_expansion_body_curve(study_id, curve)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def delete_expansion_body_curve(study_id: str, curve_id: int) -> dict[str, Any]:
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    db.delete_expansion_body_curve(study_id, curve_id)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def _recipe_source_snapshot(version: dict) -> dict[str, Any]:
+    """来源冻结配方的快照：投料、Seger 釉式与备注（不可变副本）。"""
+    return {
+        "version_id": version["id"],
+        "items": version["items"],
+        "seger": version["result"].get("seger"),
+        "note": version.get("note"),
+        "constants_version": version.get("constants_version"),
+    }
+
+
+def add_expansion_recipe(
+    study_id: str, req: ExpansionRecipeCreate
+) -> dict[str, Any]:
+    """登记一份冻结配方及其同批釉条曲线（草稿；1~20 份，版本不可重复）。"""
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    if db.count_expansion_recipes(study_id) >= EXPANSION_MAX_RECIPES:
+        raise GlazeError(
+            f"研究内配方已达上限 {EXPANSION_MAX_RECIPES} 份，请先删除再登记",
+            "too_many_recipes",
+            {"max_recipes": EXPANSION_MAX_RECIPES},
+        )
+    version = db.get_version(req.version_id)  # 404: 来源配方不存在
+    curves = [_normalize_curve(c) for c in req.curves]
+    recipe_index = db.next_expansion_recipe_index(study_id)
+    db.add_expansion_recipe(
+        study_id,
+        recipe_index=recipe_index,
+        version_id=version["id"],
+        recipe_snapshot=_recipe_source_snapshot(version),
+        curves=curves,
+        note=req.note,
+    )
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def delete_expansion_recipe(study_id: str, recipe_index: int) -> dict[str, Any]:
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    db.delete_expansion_recipe(study_id, recipe_index)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def add_expansion_glaze_curve(
+    study_id: str, recipe_index: int, req: ExpansionCurveInput
+) -> dict[str, Any]:
+    """向草稿研究的既有配方补登一条釉条曲线（同测次同值幂等）。"""
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    recipe = db.get_expansion_recipe(study_id, recipe_index)  # 404
+    curve = _normalize_curve(req)
+    db.add_expansion_glaze_curve(recipe["id"], curve)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def delete_expansion_glaze_curve(
+    study_id: str, recipe_index: int, curve_id: int
+) -> dict[str, Any]:
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    recipe = db.get_expansion_recipe(study_id, recipe_index)  # 404
+    db.delete_expansion_glaze_curve(recipe["id"], curve_id)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def add_expansion_exclusion(
+    study_id: str, req: ExpansionExclusionCreate
+) -> dict[str, Any]:
+    """登记一条异常测次排除（草稿；须注明原因，目标测次须存在）。"""
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    recipe_index = req.recipe_index if req.scope == "glaze" else 0
+    # 目标测次须存在：排除不存在的曲线属于登记错误
+    if req.scope == "body":
+        targets = [
+            c for c in db.list_expansion_body_curves(study_id)
+            if c["replicate_no"] == req.replicate_no
+            and c["direction"] == req.direction
+        ]
+    else:
+        recipe = db.get_expansion_recipe(study_id, req.recipe_index)  # 404
+        targets = [
+            c for c in recipe["curves"]
+            if c["replicate_no"] == req.replicate_no
+            and c["direction"] == req.direction
+        ]
+    if not targets:
+        raise GlazeError(
+            f"找不到要排除的测次: {req.scope} 测次 {req.replicate_no} "
+            f"方向 {req.direction}",
+            "exclusion_target_missing",
+            {
+                "scope": req.scope,
+                "recipe_index": req.recipe_index,
+                "replicate_no": req.replicate_no,
+                "direction": req.direction,
+            },
+        )
+    db.add_expansion_exclusion(
+        study_id,
+        {
+            "scope": req.scope,
+            "recipe_index": recipe_index,
+            "replicate_no": req.replicate_no,
+            "direction": req.direction,
+            "reason": req.reason,
+        },
+    )
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+def delete_expansion_exclusion(study_id: str, exclusion_id: int) -> dict[str, Any]:
+    study = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(study, ("draft",))
+    db.delete_expansion_exclusion(study_id, exclusion_id)
+    return assemble_expansion_study(db.get_expansion_study(study_id))
+
+
+# ---------------------------------------------------------------------------
+# 热膨胀分析（只读计算）与配方排列
+# ---------------------------------------------------------------------------
+
+def _expansion_analysis_input(study_id: str):
+    """组装分析输入：应用排除后的坯条/釉条配对曲线与弹性参数。"""
+    study = db.get_expansion_study(study_id)  # 404
+    body_rows = db.list_expansion_body_curves(study_id)
+    recipe_rows = db.list_expansion_recipes(study_id)
+    exclusions = db.list_expansion_exclusions(study_id)
+    excluded = {
+        (e["scope"], e["recipe_index"], e["replicate_no"], e["direction"])
+        for e in exclusions
+    }
+
+    body_curves: dict[str, dict[int, Any]] = {}
+    for row in body_rows:
+        if ("body", 0, row["replicate_no"], row["direction"]) in excluded:
+            continue
+        curve = expansion.curve_arrays(row["points"])
+        body_curves.setdefault(row["direction"], {})[row["replicate_no"]] = curve
+
+    recipes: list[dict[str, Any]] = []
+    for r in recipe_rows:
+        curves: dict[str, dict[int, Any]] = {}
+        for c in r["curves"]:
+            key = ("glaze", r["recipe_index"], c["replicate_no"], c["direction"])
+            if key in excluded:
+                continue
+            curves.setdefault(c["direction"], {})[c["replicate_no"]] = (
+                expansion.curve_arrays(c["points"])
+            )
+        recipes.append({
+            "recipe_index": r["recipe_index"],
+            "version_id": r["version_id"],
+            "curves": curves,
+        })
+    return study, recipes, body_curves, exclusions
+
+
+def _window_tuple(req: ExpansionAnalysisParams) -> Optional[tuple[float, float]]:
+    if req.stress_low_mpa is None or req.stress_high_mpa is None:
+        return None
+    return (req.stress_low_mpa, req.stress_high_mpa)
+
+
+def _run_expansion_analysis(
+    study_id: str, req: ExpansionAnalysisParams
+) -> tuple[dict, list[dict], dict[str, Any]]:
+    """执行分析计算，返回 (研究行, 应用的排除, 分析结果)。"""
+    study, recipes, body_curves, exclusions = _expansion_analysis_input(study_id)
+    result = expansion.analyze_study_data(
+        elastic=_expansion_elastic(study),
+        body_curves=body_curves,
+        recipes=recipes,
+        room_temp_c=req.room_temp_c,
+        n_segments=req.n_segments,
+        stress_window=_window_tuple(req),
+    )
+    return study, exclusions, result
+
+
+def analyze_expansion_study(
+    study_id: str, req: ExpansionAnalysisParams
+) -> dict[str, Any]:
+    """对重复曲线插值并积分釉坯膨胀差（只读计算，草稿与定稿均可）。"""
+    study, exclusions, result = _run_expansion_analysis(study_id, req)
+    return {
+        "study_id": study["id"],
+        "status": study["status"],
+        "version_no": study["version_no"],
+        **result,
+        "exclusions": exclusions,
+        "n_recipes": len(result["recipes"]),
+        "constants_version": CONSTANTS_VERSION,
+    }
+
+
+def rank_expansion_recipes(
+    study_id: str, req: ExpansionRankRequest
+) -> dict[str, Any]:
+    """按目标应力窗、最坏区间和不确定度排列配方（只读计算）。"""
+    study, exclusions, result = _run_expansion_analysis(study_id, req)
+    ranked = expansion.rank_recipes(
+        result,
+        stress_low_mpa=req.stress_low_mpa,
+        stress_high_mpa=req.stress_high_mpa,
+        max_candidates=req.max_candidates,
+    )
+    return {
+        "study_id": study["id"],
+        "status": study["status"],
+        "version_no": study["version_no"],
+        "stress_window_mpa": {
+            "low": req.stress_low_mpa,
+            "high": req.stress_high_mpa,
+        },
+        "common_range_c": result["common_range_c"],
+        "room_temp_c": result["room_temp_c"],
+        "stress_release_temp_c": result["stress_release_temp_c"],
+        "n_segments": result["n_segments"],
+        "ranking": ranked,
+        "best": ranked[0] if ranked else None,
+        "n_recipes": len(result["recipes"]),
+        "exclusions": exclusions,
+        "constants_version": CONSTANTS_VERSION,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 热膨胀研究定稿 / 复制 / 比较
+# ---------------------------------------------------------------------------
+
+def _expansion_snapshot(
+    study: dict, req: ExpansionAnalysisParams, exclusions: list[dict]
+) -> dict[str, Any]:
+    """定稿快照：研究参数、原始曲线、来源配方、排除记录与计算参数。"""
+    return {
+        "study": {
+            "id": study["id"],
+            "body_name": study["body_name"],
+            "version_no": study["version_no"],
+            "parent_id": study["parent_id"],
+            "root_id": study["root_id"],
+            "params": _expansion_params_dict(study),
+        },
+        "body_curves": db.list_expansion_body_curves(study["id"]),
+        "recipes": db.list_expansion_recipes(study["id"]),
+        "exclusions": exclusions,
+        "analysis_params": {
+            "room_temp_c": req.room_temp_c,
+            "n_segments": req.n_segments,
+            "stress_low_mpa": req.stress_low_mpa,
+            "stress_high_mpa": req.stress_high_mpa,
+        },
+        "constants_version": CONSTANTS_VERSION,
+    }
+
+
+def finalize_expansion_study(
+    study_id: str, req: ExpansionFinalizeRequest
+) -> tuple[dict[str, Any], bool]:
+    """定稿冻结原始曲线、来源配方与计算参数；重复定稿返回同一结果。
+
+    定稿时执行一次完整分析并把结果存入冻结记录；后续测量只能写入
+    复制出的新版本草稿，不得改写已定稿结果。
+    """
+    study = db.get_expansion_study(study_id)  # 404
+    if study["status"] == "finalized" and study.get("freeze_id"):
+        return db.get_expansion_freeze(study["freeze_id"]), False
+    _require_expansion_status(study, ("draft",))
+    if db.count_expansion_recipes(study_id) < 1:
+        raise GlazeError(
+            "研究内没有任何配方，无法定稿", "empty_expansion_study"
+        )
+    _study, exclusions, result = _run_expansion_analysis(study_id, req)
+    snapshot = _expansion_snapshot(study, req, exclusions)
+    final_state = {
+        **result,
+        "n_recipes": len(result["recipes"]),
+        "n_exclusions": len(exclusions),
+    }
+    freeze_id = "texf_" + _canonical_hash(
+        {"study_id": study["id"], "final_state": final_state, "snapshot": snapshot}
+    )
+    stored, created = db.save_expansion_freeze(
+        freeze_id=freeze_id,
+        study_id=study["id"],
+        note=req.note,
+        final_state=final_state,
+        snapshot=snapshot,
+    )
+    db.update_expansion_study_status(study_id, "finalized", freeze_id=stored["id"])
+    return stored, created
+
+
+def copy_expansion_study(
+    study_id: str, req: ExpansionCopyRequest
+) -> dict[str, Any]:
+    """把已定稿研究复制为新版本草稿（补测用），版本号在谱系内递增。"""
+    source = db.get_expansion_study(study_id)  # 404
+    _require_expansion_status(source, ("finalized",))
+    new_id = "tex_" + uuid.uuid4().hex
+    version_no = db.expansion_lineage_max_version(source["root_id"]) + 1
+    note = req.note if req.note is not None else source["note"]
+    db.create_expansion_study(
+        study_id=new_id,
+        body_name=source["body_name"],
+        version_no=version_no,
+        parent_id=source["id"],
+        root_id=source["root_id"],
+        params=_expansion_params_dict(source),
+        note=note,
+    )
+    for curve in db.list_expansion_body_curves(study_id):
+        db.add_expansion_body_curve(
+            new_id,
+            {
+                "replicate_no": curve["replicate_no"],
+                "direction": curve["direction"],
+                "points": curve["points"],
+                "note": curve["note"],
+            },
+        )
+    for recipe in db.list_expansion_recipes(study_id):
+        db.add_expansion_recipe(
+            new_id,
+            recipe_index=recipe["recipe_index"],
+            version_id=recipe["version_id"],
+            recipe_snapshot=recipe["recipe_snapshot"],
+            curves=[
+                {
+                    "replicate_no": c["replicate_no"],
+                    "direction": c["direction"],
+                    "points": c["points"],
+                    "note": c["note"],
+                }
+                for c in recipe["curves"]
+            ],
+            note=recipe["note"],
+        )
+    for exclusion in db.list_expansion_exclusions(study_id):
+        db.add_expansion_exclusion(
+            new_id,
+            {
+                "scope": exclusion["scope"],
+                "recipe_index": exclusion["recipe_index"],
+                "replicate_no": exclusion["replicate_no"],
+                "direction": exclusion["direction"],
+                "reason": exclusion["reason"],
+            },
+        )
+    return assemble_expansion_study(db.get_expansion_study(new_id))
+
+
+def compare_expansion_studies(
+    study_id: str, other_id: str
+) -> dict[str, Any]:
+    """比较两个已定稿研究的冻结结果：共有配方逐份给出应力/应变变化。"""
+    study = db.get_expansion_study(study_id)  # 404
+    other = db.get_expansion_study(other_id)  # 404
+    for s in (study, other):
+        _require_expansion_status(s, ("finalized",))
+    freeze_a = db.get_expansion_freeze(study["freeze_id"])
+    freeze_b = db.get_expansion_freeze(other["freeze_id"])
+    result_a = freeze_a["final_state"]
+    result_b = freeze_b["final_state"]
+
+    param_changes: dict[str, dict[str, Any]] = {}
+    params_a = freeze_a["snapshot"]["study"]["params"]
+    params_b = freeze_b["snapshot"]["study"]["params"]
+    for key in sorted(set(params_a) | set(params_b)):
+        if params_a.get(key) != params_b.get(key):
+            param_changes[key] = {"study": params_a.get(key), "other": params_b.get(key)}
+
+    diff = expansion.compare_results(result_a, result_b)
+    return {
+        "study_id": study["id"],
+        "other_study_id": other["id"],
+        "study": {
+            "version_no": study["version_no"],
+            "freeze_id": freeze_a["id"],
+            "body_name": study["body_name"],
+        },
+        "other": {
+            "version_no": other["version_no"],
+            "freeze_id": freeze_b["id"],
+            "body_name": other["body_name"],
+        },
+        "param_changes": param_changes,
+        "recipes": diff["shared_recipes"],
+        "only_in_study": diff["only_in_base"],
+        "only_in_other": diff["only_in_other"],
+        "constants_version": CONSTANTS_VERSION,
+    }

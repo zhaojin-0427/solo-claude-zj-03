@@ -1176,3 +1176,231 @@ class FiringResultFreezeRequest(BaseModel):
     def _check_request(self) -> "FiringResultFreezeRequest":
         _check_metric_constraints(self.limits, self.targets)
         return self
+
+
+# ---------------------------------------------------------------------------
+# 釉坯热膨胀适配研究
+# ---------------------------------------------------------------------------
+
+from .config import (  # noqa: E402
+    EXPANSION_DEFAULT_SEGMENTS,
+    EXPANSION_MAX_RECIPES,
+    EXPANSION_MAX_SEGMENTS,
+    EXPANSION_MIN_CURVE_POINTS,
+    EXPANSION_ROOM_TEMP_C,
+)
+
+ExpansionDirection = Literal["heating", "cooling"]
+
+
+class ExpansionCurvePoint(BaseModel):
+    """膨胀仪曲线上的一个点：温度（°C）—相对长度（按曲线声明的单位）。"""
+
+    temp_c: float = Field(..., ge=-50.0, le=1600.0, description="温度（°C）")
+    strain: float = Field(
+        ..., description="相对长度变化 ΔL/L0（单位见曲线的 strain_unit）"
+    )
+
+
+class ExpansionCurveInput(BaseModel):
+    """一条膨胀曲线：重复测次编号 + 升降温方向 + 温度—相对长度点列。"""
+
+    replicate_no: int = Field(..., ge=1, le=999, description="重复测次编号（从 1 起）")
+    direction: ExpansionDirection = Field(
+        ..., description="heating 升温 / cooling 降温"
+    )
+    strain_unit: Literal["1", "ppm", "%"] = Field(
+        default="1",
+        description="相对长度单位：1=无量纲应变 / ppm=1e-6 / %=1e-2",
+    )
+    points: list[ExpansionCurvePoint] = Field(
+        ..., min_length=EXPANSION_MIN_CURVE_POINTS,
+        description="温度—相对长度点列（升温严格递增、降温严格递减）",
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_temperature_order(self) -> "ExpansionCurveInput":
+        from . import expansion
+
+        expansion.check_temperature_order(
+            [p.temp_c for p in self.points], self.direction
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "ExpansionCurveInput":
+        temps = [p.temp_c for p in self.points]
+        if len(set(temps)) != len(temps):
+            raise GlazeError(
+                "同一曲线内温度不得重复",
+                "duplicate_temperature",
+                {"temps_c": temps},
+            )
+        if self.direction == "heating":
+            bad = any(b <= a for a, b in zip(temps, temps[1:]))
+        else:
+            bad = any(b >= a for a, b in zip(temps, temps[1:]))
+        if bad:
+            label = "升温" if self.direction == "heating" else "降温"
+            order = "递增" if self.direction == "heating" else "递减"
+            raise GlazeError(
+                f"{label}曲线的温度必须严格{order}",
+                "invalid_temperature_order",
+                {"direction": self.direction, "temps_c": temps},
+            )
+        return self
+
+
+class ExpansionStudyCreate(BaseModel):
+    """创建釉坯热膨胀适配研究：一个坯体型号 + 弹性/几何参数（草稿）。"""
+
+    body_name: str = Field(min_length=1, max_length=64, description="坯体型号")
+    glaze_thickness_mm: float = Field(..., gt=0.0, le=50.0, description="釉层厚度（mm）")
+    body_thickness_mm: float = Field(..., gt=0.0, le=100.0, description="坯体厚度（mm）")
+    glaze_elastic_modulus_gpa: float = Field(
+        ..., gt=0.0, le=1000.0, description="釉弹性模量（GPa）"
+    )
+    body_elastic_modulus_gpa: float = Field(
+        ..., gt=0.0, le=1000.0, description="坯体弹性模量（GPa）"
+    )
+    glaze_poisson_ratio: float = Field(..., ge=0.0, lt=0.5, description="釉泊松比")
+    body_poisson_ratio: float = Field(..., ge=0.0, lt=0.5, description="坯体泊松比")
+    stress_release_temp_c: float = Field(
+        ..., ge=0.0, le=1500.0, description="应力释放温度（°C）"
+    )
+    thickness_unit: Literal["mm"] = Field(
+        default="mm", description="厚度单位（仅支持 mm）"
+    )
+    modulus_unit: Literal["GPa"] = Field(
+        default="GPa", description="弹性模量单位（仅支持 GPa）"
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "ExpansionStudyCreate":
+        if not self.body_name.strip():
+            raise GlazeError(
+                "坯体型号不得为空白", "blank_field", {"field": "body_name"}
+            )
+        self.body_name = self.body_name.strip()
+        return self
+
+
+class ExpansionRecipeCreate(BaseModel):
+    """向研究登记一份冻结配方及其同批釉条曲线（1 份配方一次登记）。"""
+
+    version_id: str = Field(min_length=1, description="来源冻结配方版本 id")
+    curves: list[ExpansionCurveInput] = Field(
+        ..., min_length=1, description="同批釉条膨胀曲线（重复测次 × 方向）"
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_curves(self) -> "ExpansionRecipeCreate":
+        seen: set[tuple[int, str]] = set()
+        for c in self.curves:
+            key = (c.replicate_no, c.direction)
+            if key in seen:
+                raise GlazeError(
+                    f"同一配方内测次重复: 重复编号 {c.replicate_no} "
+                    f"方向 {c.direction}",
+                    "duplicate_replicate",
+                    {"replicate_no": c.replicate_no, "direction": c.direction},
+                )
+            seen.add(key)
+        return self
+
+
+class ExpansionExclusionCreate(BaseModel):
+    """排除一条异常测次曲线（须注明原因）；坯条 scope=body，釉条 scope=glaze。"""
+
+    scope: Literal["body", "glaze"] = Field(..., description="body 坯条 / glaze 釉条")
+    recipe_index: Optional[int] = Field(
+        default=None, ge=1, le=EXPANSION_MAX_RECIPES,
+        description="釉条所属配方序号（scope=glaze 时必填）",
+    )
+    replicate_no: int = Field(..., ge=1, le=999, description="重复测次编号")
+    direction: ExpansionDirection = Field(..., description="升降温方向")
+    reason: str = Field(..., min_length=1, max_length=200, description="排除原因")
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "ExpansionExclusionCreate":
+        if not self.reason.strip():
+            raise GlazeError("排除原因不得为空白", "blank_exclusion_reason")
+        self.reason = self.reason.strip()
+        if self.scope == "glaze" and self.recipe_index is None:
+            raise GlazeError(
+                "排除釉条测次时必须给出 recipe_index",
+                "exclusion_recipe_missing",
+            )
+        if self.scope == "body" and self.recipe_index is not None:
+            raise GlazeError(
+                "排除坯条测次时不允许给 recipe_index",
+                "exclusion_recipe_not_allowed",
+            )
+        return self
+
+
+class ExpansionAnalysisParams(BaseModel):
+    """分析计算参数：室温基准、分段数与可选目标应力窗。"""
+
+    room_temp_c: float = Field(
+        default=EXPANSION_ROOM_TEMP_C, ge=-50.0, le=200.0,
+        description="室温基准（°C，残余应变积分下限）",
+    )
+    n_segments: int = Field(
+        default=EXPANSION_DEFAULT_SEGMENTS, ge=1, le=EXPANSION_MAX_SEGMENTS,
+        description="共同温区分段线膨胀系数段数",
+    )
+    stress_low_mpa: Optional[float] = Field(
+        default=None, ge=-2000.0, le=2000.0,
+        description="目标应力窗下限（MPa，压应力侧/剥釉限）",
+    )
+    stress_high_mpa: Optional[float] = Field(
+        default=None, ge=-2000.0, le=2000.0,
+        description="目标应力窗上限（MPa，拉应力侧/开裂限）",
+    )
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "ExpansionAnalysisParams":
+        low, high = self.stress_low_mpa, self.stress_high_mpa
+        if (low is None) != (high is None):
+            raise GlazeError(
+                "目标应力窗须同时给出下限与上限",
+                "incomplete_stress_window",
+            )
+        if low is not None and high is not None and low >= high:
+            raise GlazeError(
+                f"目标应力窗矛盾: low={low} >= high={high}",
+                "contradictory_bounds",
+                {"low": low, "high": high},
+            )
+        return self
+
+
+class ExpansionRankRequest(ExpansionAnalysisParams):
+    """配方排列：目标应力窗必填，按窗外计数/最坏区间/不确定度排序。"""
+
+    stress_low_mpa: float = Field(
+        ..., ge=-2000.0, le=2000.0, description="目标应力窗下限（MPa）"
+    )
+    stress_high_mpa: float = Field(
+        ..., ge=-2000.0, le=2000.0, description="目标应力窗上限（MPa）"
+    )
+    max_candidates: int = Field(
+        default=EXPANSION_MAX_RECIPES, ge=1, le=EXPANSION_MAX_RECIPES,
+        description="返回配方条数上限",
+    )
+
+
+class ExpansionFinalizeRequest(ExpansionAnalysisParams):
+    """定稿请求：计算参数随原始曲线、来源配方一并冻结；定稿幂等。"""
+
+    note: Optional[str] = None
+
+
+class ExpansionCopyRequest(BaseModel):
+    """把已定稿研究复制为新版本草稿（补测用），可覆盖备注。"""
+
+    note: Optional[str] = None

@@ -4,6 +4,10 @@
 ``robust_versions`` 仅 INSERT 与 SELECT，通过对输入哈希建唯一索引
 实现"同一版本重复读取保持一致"。釉浆批次在 planned/mixing 期间
 可追加台账，定稿（``slurry_freezes``）后全部记录冻结且幂等。
+烧成试片研究与釉坯热膨胀适配研究按 草稿 -> 定稿只读 -> 复制新版
+流转：草稿期可增删试片/曲线/配方/排除，定稿（``firing_freezes`` /
+``expansion_freezes``）后全部记录冻结，后续测量只能写入复制出的
+新版本草稿，不得改写已定稿结果。
 """
 from __future__ import annotations
 
@@ -213,6 +217,85 @@ CREATE TABLE IF NOT EXISTS firing_result_freezes (
     selected           TEXT NOT NULL,     -- 选定配比与全部指标预测
     source_snapshot    TEXT NOT NULL,     -- 来源试验+试片数据+拟合结果快照
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS expansion_studies (
+    id                          TEXT PRIMARY KEY,  -- tex_<uuid>
+    body_name                   TEXT NOT NULL,     -- 坯体型号
+    status                      TEXT NOT NULL,     -- draft / finalized
+    version_no                  INTEGER NOT NULL,  -- 谱系内版本号（复制补测递增）
+    parent_id                   TEXT,              -- 复制来源研究 id
+    root_id                     TEXT NOT NULL,     -- 谱系根研究 id
+    glaze_thickness_mm          REAL NOT NULL,     -- 釉层厚度
+    body_thickness_mm           REAL NOT NULL,     -- 坯体厚度
+    glaze_elastic_modulus_gpa   REAL NOT NULL,     -- 釉弹性模量
+    body_elastic_modulus_gpa    REAL NOT NULL,     -- 坯体弹性模量
+    glaze_poisson_ratio         REAL NOT NULL,
+    body_poisson_ratio          REAL NOT NULL,
+    stress_release_temp_c       REAL NOT NULL,     -- 应力释放温度
+    note                        TEXT,
+    freeze_id                   TEXT,              -- 定稿后指向 expansion_freezes.id
+    created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+    finalized_at                TEXT
+);
+
+CREATE TABLE IF NOT EXISTS expansion_body_curves (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id        TEXT NOT NULL,      -- 所属研究
+    replicate_no    INTEGER NOT NULL,   -- 重复测次编号（从 1 起）
+    direction       TEXT NOT NULL,      -- heating / cooling
+    points          TEXT NOT NULL,      -- JSON: [{temp_c, strain}]（无量纲应变，温度升序）
+    n_points        INTEGER NOT NULL,
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (study_id, replicate_no, direction)
+);
+
+CREATE TABLE IF NOT EXISTS expansion_recipes (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id         TEXT NOT NULL,     -- 所属研究
+    recipe_index     INTEGER NOT NULL,  -- 研究内配方序号（1~20，删除后不重排）
+    version_id       TEXT NOT NULL,     -- 来源冻结配方版本
+    recipe_snapshot  TEXT NOT NULL,     -- 来源配方快照（投料/釉式）
+    note             TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (study_id, recipe_index),
+    UNIQUE (study_id, version_id)
+);
+
+CREATE TABLE IF NOT EXISTS expansion_glaze_curves (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id       INTEGER NOT NULL,   -- 所属配方（expansion_recipes.id）
+    replicate_no    INTEGER NOT NULL,   -- 重复测次编号（从 1 起）
+    direction       TEXT NOT NULL,      -- heating / cooling
+    points          TEXT NOT NULL,      -- JSON: [{temp_c, strain}]（无量纲应变，温度升序）
+    n_points        INTEGER NOT NULL,
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (recipe_id, replicate_no, direction),
+    FOREIGN KEY (recipe_id) REFERENCES expansion_recipes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS expansion_exclusions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id        TEXT NOT NULL,      -- 所属研究
+    scope           TEXT NOT NULL,      -- body / glaze
+    recipe_index    INTEGER NOT NULL,   -- 釉条为配方序号；坯条固定 0
+    replicate_no    INTEGER NOT NULL,
+    direction       TEXT NOT NULL,
+    reason          TEXT NOT NULL,      -- 排除原因（必填）
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (study_id, scope, recipe_index, replicate_no, direction)
+);
+
+CREATE TABLE IF NOT EXISTS expansion_freezes (
+    id          TEXT PRIMARY KEY,       -- texf_<hash>
+    study_id    TEXT NOT NULL UNIQUE,   -- 一研究只能定稿一次，重复定稿取旧记录
+    note        TEXT,
+    final_state TEXT NOT NULL,          -- 定稿时的全部分析结果（含计算参数）
+    snapshot    TEXT NOT NULL,          -- 原始曲线/来源配方/排除/参数完整快照
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -1407,4 +1490,534 @@ def _firing_result_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     for key in ("fit_options", "search_constraints", "selected", "source_snapshot"):
         data[key] = json.loads(data[key])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 釉坯热膨胀适配研究（草稿 -> 定稿只读 -> 复制新版补测）
+# ---------------------------------------------------------------------------
+
+def create_expansion_study(
+    *,
+    study_id: str,
+    body_name: str,
+    version_no: int,
+    parent_id: Optional[str],
+    root_id: str,
+    params: dict[str, Any],
+    note: Optional[str],
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO expansion_studies
+                   (id, body_name, status, version_no, parent_id, root_id,
+                    glaze_thickness_mm, body_thickness_mm,
+                    glaze_elastic_modulus_gpa, body_elastic_modulus_gpa,
+                    glaze_poisson_ratio, body_poisson_ratio,
+                    stress_release_temp_c, note)
+               VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                body_name,
+                version_no,
+                parent_id,
+                root_id,
+                params["glaze_thickness_mm"],
+                params["body_thickness_mm"],
+                params["glaze_elastic_modulus_gpa"],
+                params["body_elastic_modulus_gpa"],
+                params["glaze_poisson_ratio"],
+                params["body_poisson_ratio"],
+                params["stress_release_temp_c"],
+                note,
+            ),
+        )
+    return get_expansion_study(study_id)
+
+
+def get_expansion_study(study_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM expansion_studies WHERE id = ?", (study_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"釉坯热膨胀研究不存在: {study_id}", "expansion_study_not_found"
+        )
+    return dict(row)
+
+
+def list_expansion_studies(limit: int = 50) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM expansion_studies ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def expansion_lineage_max_version(root_id: str) -> int:
+    """谱系（同一根研究及其全部复制版本）内的最大版本号。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version_no), 0) AS max_v FROM expansion_studies "
+            "WHERE root_id = ?",
+            (root_id,),
+        ).fetchone()
+    return int(row["max_v"])
+
+
+def update_expansion_study_status(
+    study_id: str, status: str, freeze_id: Optional[str] = None
+) -> None:
+    with get_conn() as conn:
+        if status == "finalized":
+            conn.execute(
+                """UPDATE expansion_studies
+                   SET status=?, freeze_id=?,
+                       finalized_at=datetime('now'), updated_at=datetime('now')
+                   WHERE id=?""",
+                (status, freeze_id, study_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE expansion_studies SET status=?, updated_at=datetime('now') "
+                "WHERE id=?",
+                (status, study_id),
+            )
+
+
+# ---------------------------------------------------------------------------
+# 坯条膨胀曲线（草稿期可增删；定稿后随研究只读）
+# ---------------------------------------------------------------------------
+
+def _curve_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["points"] = json.loads(data["points"])
+    return data
+
+
+def add_expansion_body_curve(
+    study_id: str, curve: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """登记一条坯条膨胀曲线；同测次同方向已存在则幂等返回旧记录。
+
+    测次/方向相同但曲线点不同视为冲突，抛出 :class:`GlazeError`。
+    """
+    from .errors import GlazeError
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT * FROM expansion_body_curves
+               WHERE study_id = ? AND replicate_no = ? AND direction = ?""",
+            (study_id, curve["replicate_no"], curve["direction"]),
+        ).fetchone()
+        if existing is not None:
+            old = _curve_row_to_dict(existing)
+            if old["points"] == curve["points"]:
+                return old, False
+            raise GlazeError(
+                f"坯条测次 {curve['replicate_no']}（{curve['direction']}）已存在"
+                "且曲线点不同，请改用新的测次编号",
+                "duplicate_replicate",
+                {
+                    "replicate_no": curve["replicate_no"],
+                    "direction": curve["direction"],
+                    "existing_curve_id": old["id"],
+                },
+            )
+        cur = conn.execute(
+            """INSERT INTO expansion_body_curves
+                   (study_id, replicate_no, direction, points, n_points, note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                curve["replicate_no"],
+                curve["direction"],
+                json.dumps(curve["points"], sort_keys=True),
+                len(curve["points"]),
+                curve.get("note"),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM expansion_body_curves WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _curve_row_to_dict(row), True
+
+
+def list_expansion_body_curves(study_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM expansion_body_curves WHERE study_id = ? "
+            "ORDER BY direction, replicate_no, id",
+            (study_id,),
+        ).fetchall()
+    return [_curve_row_to_dict(r) for r in rows]
+
+
+def delete_expansion_body_curve(study_id: str, curve_id: int) -> None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM expansion_body_curves WHERE study_id = ? AND id = ?",
+            (study_id, curve_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"坯条曲线不存在: study={study_id} curve={curve_id}",
+                "expansion_curve_not_found",
+            )
+        conn.execute(
+            "DELETE FROM expansion_body_curves WHERE study_id = ? AND id = ?",
+            (study_id, curve_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 研究配方与釉条曲线（草稿期可增删；定稿后随研究只读）
+# ---------------------------------------------------------------------------
+
+def _expansion_recipe_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["recipe_snapshot"] = json.loads(data["recipe_snapshot"])
+    return data
+
+
+def next_expansion_recipe_index(study_id: str) -> int:
+    """研究内最小的空闲配方序号（1 起；删除后的空位可复用）。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT recipe_index FROM expansion_recipes WHERE study_id = ?",
+            (study_id,),
+        ).fetchall()
+    used = {int(r["recipe_index"]) for r in rows}
+    idx = 1
+    while idx in used:
+        idx += 1
+    return idx
+
+
+def count_expansion_recipes(study_id: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM expansion_recipes WHERE study_id = ?",
+            (study_id,),
+        ).fetchone()
+    return int(row["n"])
+
+
+def add_expansion_recipe(
+    study_id: str,
+    *,
+    recipe_index: int,
+    version_id: str,
+    recipe_snapshot: dict[str, Any],
+    curves: list[dict[str, Any]],
+    note: Optional[str],
+) -> dict[str, Any]:
+    """登记一份配方及其同批釉条曲线；同版本重复登记抛出 :class:`GlazeError`。"""
+    from .errors import GlazeError
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id, recipe_index FROM expansion_recipes "
+            "WHERE study_id = ? AND version_id = ?",
+            (study_id, version_id),
+        ).fetchone()
+        if existing is not None:
+            raise GlazeError(
+                f"配方版本 {version_id} 已登记为第 {existing['recipe_index']} 份配方",
+                "duplicate_recipe",
+                {"version_id": version_id,
+                 "recipe_index": existing["recipe_index"]},
+            )
+        cur = conn.execute(
+            """INSERT INTO expansion_recipes
+                   (study_id, recipe_index, version_id, recipe_snapshot, note)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                recipe_index,
+                version_id,
+                json.dumps(recipe_snapshot, sort_keys=True, ensure_ascii=False),
+                note,
+            ),
+        )
+        recipe_id = cur.lastrowid
+        for curve in curves:
+            conn.execute(
+                """INSERT INTO expansion_glaze_curves
+                       (recipe_id, replicate_no, direction, points, n_points, note)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    recipe_id,
+                    curve["replicate_no"],
+                    curve["direction"],
+                    json.dumps(curve["points"], sort_keys=True),
+                    len(curve["points"]),
+                    curve.get("note"),
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM expansion_recipes WHERE id = ?", (recipe_id,)
+        ).fetchone()
+    return _expansion_recipe_row_to_dict(row)
+
+
+def list_expansion_recipes(study_id: str) -> list[dict[str, Any]]:
+    """研究内全部配方（按序号），每份附带釉条曲线。"""
+    with get_conn() as conn:
+        recipes = conn.execute(
+            "SELECT * FROM expansion_recipes WHERE study_id = ? "
+            "ORDER BY recipe_index",
+            (study_id,),
+        ).fetchall()
+        out = []
+        for r in recipes:
+            data = _expansion_recipe_row_to_dict(r)
+            curves = conn.execute(
+                "SELECT * FROM expansion_glaze_curves WHERE recipe_id = ? "
+                "ORDER BY direction, replicate_no, id",
+                (data["id"],),
+            ).fetchall()
+            data["curves"] = [_curve_row_to_dict(c) for c in curves]
+            out.append(data)
+    return out
+
+
+def add_expansion_glaze_curve(
+    recipe_id: int, curve: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """向既有配方补登一条釉条曲线；同测次同方向已存在则幂等返回旧记录。
+
+    测次/方向相同但曲线点不同视为冲突，抛出 :class:`GlazeError`。
+    """
+    from .errors import GlazeError
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT * FROM expansion_glaze_curves
+               WHERE recipe_id = ? AND replicate_no = ? AND direction = ?""",
+            (recipe_id, curve["replicate_no"], curve["direction"]),
+        ).fetchone()
+        if existing is not None:
+            old = _curve_row_to_dict(existing)
+            if old["points"] == curve["points"]:
+                return old, False
+            raise GlazeError(
+                f"釉条测次 {curve['replicate_no']}（{curve['direction']}）已存在"
+                "且曲线点不同，请改用新的测次编号",
+                "duplicate_replicate",
+                {
+                    "replicate_no": curve["replicate_no"],
+                    "direction": curve["direction"],
+                    "existing_curve_id": old["id"],
+                },
+            )
+        cur = conn.execute(
+            """INSERT INTO expansion_glaze_curves
+                   (recipe_id, replicate_no, direction, points, n_points, note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                recipe_id,
+                curve["replicate_no"],
+                curve["direction"],
+                json.dumps(curve["points"], sort_keys=True),
+                len(curve["points"]),
+                curve.get("note"),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM expansion_glaze_curves WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _curve_row_to_dict(row), True
+
+
+def delete_expansion_glaze_curve(recipe_id: int, curve_id: int) -> None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM expansion_glaze_curves WHERE recipe_id = ? AND id = ?",
+            (recipe_id, curve_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"釉条曲线不存在: recipe={recipe_id} curve={curve_id}",
+                "expansion_curve_not_found",
+            )
+        conn.execute(
+            "DELETE FROM expansion_glaze_curves WHERE recipe_id = ? AND id = ?",
+            (recipe_id, curve_id),
+        )
+
+
+def get_expansion_recipe(study_id: str, recipe_index: int) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM expansion_recipes WHERE study_id = ? AND recipe_index = ?",
+            (study_id, recipe_index),
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"配方不存在: study={study_id} recipe_index={recipe_index}",
+            "expansion_recipe_not_found",
+        )
+    return _expansion_recipe_row_to_dict(row)
+
+
+def delete_expansion_recipe(study_id: str, recipe_index: int) -> None:
+    recipe = get_expansion_recipe(study_id, recipe_index)  # 404
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM expansion_glaze_curves WHERE recipe_id = ?",
+            (recipe["id"],),
+        )
+        conn.execute(
+            "DELETE FROM expansion_recipes WHERE study_id = ? AND recipe_index = ?",
+            (study_id, recipe_index),
+        )
+        # 指向该配方的排除记录一并清理
+        conn.execute(
+            "DELETE FROM expansion_exclusions "
+            "WHERE study_id = ? AND scope = 'glaze' AND recipe_index = ?",
+            (study_id, recipe_index),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 异常测次排除（草稿期可增删；定稿后随研究只读）
+# ---------------------------------------------------------------------------
+
+def add_expansion_exclusion(
+    study_id: str, exclusion: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """登记一条测次排除；完全相同的排除幂等返回旧记录，同键不同原因视为冲突。"""
+    from .errors import GlazeError
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT * FROM expansion_exclusions
+               WHERE study_id = ? AND scope = ? AND recipe_index = ?
+                 AND replicate_no = ? AND direction = ?""",
+            (
+                study_id,
+                exclusion["scope"],
+                exclusion["recipe_index"],
+                exclusion["replicate_no"],
+                exclusion["direction"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            old = dict(existing)
+            if old["reason"] == exclusion["reason"]:
+                return old, False
+            raise GlazeError(
+                "同一测次已登记排除且原因不同，请先删除原排除再重新登记",
+                "duplicate_exclusion",
+                {"existing_exclusion_id": old["id"]},
+            )
+        cur = conn.execute(
+            """INSERT INTO expansion_exclusions
+                   (study_id, scope, recipe_index, replicate_no, direction, reason)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                exclusion["scope"],
+                exclusion["recipe_index"],
+                exclusion["replicate_no"],
+                exclusion["direction"],
+                exclusion["reason"],
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM expansion_exclusions WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return dict(row)
+
+
+def list_expansion_exclusions(study_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM expansion_exclusions WHERE study_id = ? "
+            "ORDER BY scope, recipe_index, direction, replicate_no, id",
+            (study_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_expansion_exclusion(study_id: str, exclusion_id: int) -> None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM expansion_exclusions WHERE study_id = ? AND id = ?",
+            (study_id, exclusion_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"排除记录不存在: study={study_id} exclusion={exclusion_id}",
+                "expansion_exclusion_not_found",
+            )
+        conn.execute(
+            "DELETE FROM expansion_exclusions WHERE study_id = ? AND id = ?",
+            (study_id, exclusion_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 热膨胀研究定稿快照（不可变）
+# ---------------------------------------------------------------------------
+
+def save_expansion_freeze(
+    *,
+    freeze_id: str,
+    study_id: str,
+    note: Optional[str],
+    final_state: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """定稿冻结；同研究已有冻结记录则直接返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM expansion_freezes WHERE study_id = ?", (study_id,)
+        ).fetchone()
+        if existing is not None:
+            return _expansion_freeze_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO expansion_freezes (id, study_id, note, final_state, snapshot)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                freeze_id,
+                study_id,
+                note,
+                json.dumps(final_state, sort_keys=True, ensure_ascii=False),
+                json.dumps(snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM expansion_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    return _expansion_freeze_row_to_dict(row), True
+
+
+def get_expansion_freeze(freeze_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM expansion_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"热膨胀研究定稿冻结不存在: {freeze_id}", "expansion_freeze_not_found"
+        )
+    return _expansion_freeze_row_to_dict(row)
+
+
+def find_expansion_freeze(study_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM expansion_freezes WHERE study_id = ?", (study_id,)
+        ).fetchone()
+    return _expansion_freeze_row_to_dict(row) if row is not None else None
+
+
+def _expansion_freeze_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["final_state"] = json.loads(data["final_state"])
+    data["snapshot"] = json.loads(data["snapshot"])
     return data
