@@ -464,6 +464,7 @@ def test_fit_insufficient_cells(client):
     assert err["code"] == "insufficient_design"
     regions = err["details"]["missing_regions"]
     assert any(r["type"] == "missing_edge_interior" for r in regions)
+    assert any(r["type"] == "insufficient_distinct_points" for r in regions)
 
 
 def test_fit_insufficient_tiles(client):
@@ -472,11 +473,39 @@ def test_fit_insufficient_tiles(client):
     study_id, _ = _ready_study(client, cells=cells, reps=1, finalize=False)
     resp = client.post(f"/firing-studies/{study_id}/fit", json={"model_order": 2})
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "insufficient_design"
+    err = resp.json()["error"]
+    assert err["code"] == "insufficient_design"
+    regions = err["details"]["missing_regions"]
+    assert any(r["type"] == "insufficient_replicates" for r in regions)
+
+
+def test_fit_minimal_design_cv_press_fallback(client):
+    # 最小满秩设计（格位数 = 项数）：留一格不可行，退化为留一片 PRESS，
+    # 交叉验证误差仍应可用。3 格各 2 片、L* 逐片 ±0.2 噪声：
+    # 饱和拟合的残差为 ±0.2，h=0.5，PRESS 误差为 ±0.4。
+    cells = [("A", 1.0, 0.0), ("C", 0.5, 0.5), ("E", 0.0, 1.0)]
+    experiment_id, _ = _make_experiment(client, cells=cells)
+    study = _make_study(client, experiment_id)
+    for pos, x1, x2 in cells:
+        base = 50 * x1 + 60 * x2 + 10 * x1 * x2
+        for rep, offset in ((1, -0.2), (2, 0.2)):
+            resp = client.post(
+                f"/firing-studies/{study['id']}/tiles",
+                json=_tile(pos, rep, x1, x2, l_star=round(base + offset, 6)),
+            )
+            assert resp.status_code == 201
+    fit = client.post(f"/firing-studies/{study['id']}/fit", json={"model_order": 2})
+    assert fit.status_code == 200, fit.text
+    cv = fit.json()["metrics"]["l_star"]["cv"]
+    assert cv["rmse"] == pytest.approx(0.4, abs=1e-4)
+    assert cv["n_tiles_evaluated"] == 6
+    assert cv["excluded_cells"] == []
+    assert cv["loco_cells"] == []
+    assert sorted(cv["loto_cells"]) == ["A", "C", "E"]
 
 
 def test_fit_rank_deficient(client):
-    # 全部格位同一比例：设计矩阵欠秩
+    # 全部格位同一比例：设计矩阵欠秩，诊断指出比例水平单一
     cells = [("C1", 0.5, 0.5), ("C2", 0.5, 0.5), ("C3", 0.5, 0.5)]
     study_id, _ = _ready_study(client, cells=cells, finalize=False)
     resp = client.post(f"/firing-studies/{study_id}/fit", json={"model_order": 1})
@@ -484,6 +513,26 @@ def test_fit_rank_deficient(client):
     err = resp.json()["error"]
     assert err["code"] == "rank_deficient_design"
     assert err["details"]["rank"] < err["details"]["n_terms"]
+    regions = err["details"]["missing_regions"]
+    assert any(r["type"] == "single_ratio_point" for r in regions)
+
+
+def test_fit_rank_deficient_insufficient_distinct_points(client):
+    # 仅两种不同比例水平（B 与 B2 同比例）：二次模型欠秩，
+    # 诊断指出不同比例水平数不足
+    cells = [("A", 1.0, 0.0), ("B", 0.75, 0.25), ("B2", 0.75, 0.25)]
+    study_id, _ = _ready_study(client, cells=cells, finalize=False)
+    resp = client.post(f"/firing-studies/{study_id}/fit", json={"model_order": 2})
+    assert resp.status_code == 422
+    err = resp.json()["error"]
+    assert err["code"] == "rank_deficient_design"
+    regions = err["details"]["missing_regions"]
+    point_problems = [
+        r for r in regions if r["type"] == "insufficient_distinct_points"
+    ]
+    assert point_problems
+    assert point_problems[0]["distinct_points"] == 2
+    assert point_problems[0]["needed_points"] == 3
 
 
 def test_fit_ternary_happy(client):
@@ -696,6 +745,23 @@ def test_freeze_result_candidate_out_of_range(client):
     })
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "candidate_index_out_of_range"
+
+
+def test_freeze_result_rejects_out_of_range_rate(client):
+    # 与搜索入口一致：缺陷发生率上限/目标窗口必须在 [0, 1]
+    study_id, _ = _ready_study(client, finalize=True)
+    resp = client.post(f"/firing-studies/{study_id}/result-freezes", json={
+        "limits": {"pinhole_rate": 1.5},
+    })
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_rate_limit"
+    resp = client.post(f"/firing-studies/{study_id}/result-freezes", json={
+        "targets": {"crawling_rate": {"low": 0.0, "high": 1.5}},
+    })
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_rate_target"
+    # 越界请求不得产生冻结记录
+    assert client.get(f"/firing-studies/{study_id}/result-freezes").json() == []
 
 
 def test_result_freeze_immutable_across_kiln_runs(client):

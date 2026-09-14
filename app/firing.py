@@ -18,8 +18,10 @@ q 个来源（线性 2 份 / 三元 3 份），比例 x_i ≥ 0 且 Σx_i = 1：
 设计矩阵由"有试片的格位"构成，每片试片一行（重复试片提供纯误差
 自由度）。格位数少于项数、试片总数无剩余自由度或设计矩阵欠秩时
 拒绝拟合，并指出缺少的比例区域（未使用的来源顶点、缺失的二元
-内部混合边、三元共线），不作外推。交叉验证为留一格法（LOCO）：
-整格重复试片同时留出，重拟合后回测该格。
+内部混合边、三元共线、比例水平数不足等），不作外推。交叉验证
+优先留一格（LOCO：整格重复试片同时留出重拟合）；去掉一格后设计
+欠秩时（如格位数恰等于项数的最小设计）退化为留一片 PRESS
+（``e_i/(1-h_ii)``），仅 h≈1 的饱和试片被排除。
 
 配比搜索
 --------
@@ -108,6 +110,27 @@ def design_problems(
 ) -> list[dict[str, Any]]:
     """指出设计缺少的比例区域（用于样本不足/欠秩时的诊断，不作外推）。"""
     problems: list[dict[str, Any]] = []
+    n_terms = len(scheffe_terms(q, order))
+    distinct = {
+        tuple(round(float(wi), 12) for wi in w) for w in weights_list
+    }
+    if weights_list and len(distinct) == 1:
+        only = next(iter(distinct))
+        problems.append({
+            "type": "single_ratio_point",
+            "weights": [_r(w, 9) for w in only],
+            "message": "全部格位集中在同一比例，缺少不同的比例水平",
+        })
+    elif len(distinct) < n_terms:
+        problems.append({
+            "type": "insufficient_distinct_points",
+            "distinct_points": len(distinct),
+            "needed_points": n_terms,
+            "message": (
+                f"不同比例水平仅 {len(distinct)} 个，{n_terms} 项模型"
+                f"至少需要 {n_terms} 个不同比例；请补充其他比例的格位"
+            ),
+        })
     for i in range(q):
         if all(w[i] <= 0.0 for w in weights_list):
             problems.append({
@@ -281,6 +304,15 @@ def fit_surfaces(
     n = x.shape[0]
     df = n - p
     if df < 1:
+        problems.append({
+            "type": "insufficient_replicates",
+            "n_tiles": n,
+            "n_terms": p,
+            "message": (
+                f"试片总数 {n} 等于模型项数 {p}，没有剩余自由度；"
+                "请为任意格位补充重复试片"
+            ),
+        })
         raise GlazeError(
             f"试片总数 {n} 等于模型项数 {p}，没有剩余自由度估计误差，"
             "请为至少一个格位补充重复试片",
@@ -331,20 +363,39 @@ def fit_surfaces(
                 "ci_high": _r(beta[t_idx] + t_crit * se_beta[t_idx], 6),
             })
 
-        # 留一格 CV
+        # 交叉验证：优先留一格（整格重复试片同时留出重拟合）；
+        # 剩余设计欠秩时（如格位数恰等于项数的最小设计）退化为
+        # 留一片 PRESS（e_i/(1-h_ii)）；h≈1 的饱和试片才排除。
         sq_err: list[float] = []
+        loco_cells: list[str] = []
+        loto_cells: list[str] = []
         excluded: list[str] = []
         for c_idx, cell in enumerate(cells):
-            if not cell_cv_ok[c_idx]:
-                excluded.append(cell["position"])
+            if cell_cv_ok[c_idx]:
+                mask = np.array([rc != c_idx for rc in row_cells])
+                xs, ys = x[mask], y[mask]
+                beta_sub = np.linalg.solve(xs.T @ xs, xs.T @ ys)
+                pred = float(np.array(design_row(cell["weights"], order)) @ beta_sub)
+                for k, rc in enumerate(row_cells):
+                    if rc == c_idx:
+                        sq_err.append((float(y[k]) - pred) ** 2)
+                loco_cells.append(cell["position"])
                 continue
-            mask = np.array([rc != c_idx for rc in row_cells])
-            xs, ys = x[mask], y[mask]
-            beta_sub = np.linalg.solve(xs.T @ xs, xs.T @ ys)
-            pred = float(np.array(design_row(cell["weights"], order)) @ beta_sub)
+            used_press = False
+            cell_excluded = False
             for k, rc in enumerate(row_cells):
-                if rc == c_idx:
-                    sq_err.append((float(y[k]) - pred) ** 2)
+                if rc != c_idx:
+                    continue
+                if h[k] >= 1.0 - 1e-10:
+                    cell_excluded = True  # 饱和点：留一片后该点不可估
+                    continue
+                press = float(resid[k]) / (1.0 - h[k])
+                sq_err.append(press * press)
+                used_press = True
+            if used_press:
+                loto_cells.append(cell["position"])
+            if cell_excluded:
+                excluded.append(cell["position"])
         cv_rmse = math.sqrt(sum(sq_err) / len(sq_err)) if sq_err else None
 
         # 异常试片：学生化残差
@@ -371,8 +422,11 @@ def fit_surfaces(
             "df": df,
             "cv": {
                 "method": "leave_one_cell_out",
+                "fallback": "leave_one_tile_out",
                 "rmse": _r(cv_rmse, 6) if cv_rmse is not None else None,
                 "n_tiles_evaluated": len(sq_err),
+                "loco_cells": loco_cells,
+                "loto_cells": loto_cells,
                 "excluded_cells": excluded,
             },
             "outliers": outliers,

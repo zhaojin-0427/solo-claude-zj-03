@@ -1113,6 +1113,28 @@ def _check_metric_names(names: dict) -> dict:
     return names
 
 
+def _check_metric_constraints(limits: dict, targets: dict) -> None:
+    """指标约束的公共校验：名称已知，缺陷发生率上限/目标窗口须在 [0, 1]。"""
+    _check_metric_names(limits)
+    _check_metric_names(targets)
+    for name, lim in limits.items():
+        if name.endswith("_rate") and not 0.0 <= lim <= 1.0:
+            raise GlazeError(
+                f"缺陷发生率上限 {lim} 须在 [0, 1] 内",
+                "invalid_rate_limit",
+                {"metric": name, "limit": lim},
+            )
+    for name, spec in targets.items():
+        if name.endswith("_rate") and not (
+            0.0 <= spec.low <= 1.0 and 0.0 <= spec.high <= 1.0
+        ):
+            raise GlazeError(
+                f"缺陷发生率目标窗口 [{spec.low}, {spec.high}] 须在 [0, 1] 内",
+                "invalid_rate_target",
+                {"metric": name},
+            )
+
+
 class FiringSearchRequest(BaseModel):
     """配比搜索：上限约束 + 可选目标窗口 + 比例步长。"""
 
@@ -1133,24 +1155,7 @@ class FiringSearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_request(self) -> "FiringSearchRequest":
-        _check_metric_names(self.limits)
-        _check_metric_names(self.targets)
-        for name, lim in self.limits.items():
-            if name.endswith("_rate") and not 0.0 <= lim <= 1.0:
-                raise GlazeError(
-                    f"缺陷发生率上限 {lim} 须在 [0, 1] 内",
-                    "invalid_rate_limit",
-                    {"metric": name, "limit": lim},
-                )
-        for name, spec in self.targets.items():
-            if name.endswith("_rate") and not (
-                0.0 <= spec.low <= 1.0 and 0.0 <= spec.high <= 1.0
-            ):
-                raise GlazeError(
-                    f"缺陷发生率目标窗口 [{spec.low}, {spec.high}] 须在 [0, 1] 内",
-                    "invalid_rate_target",
-                    {"metric": name},
-                )
+        _check_metric_constraints(self.limits, self.targets)
         return self
 
 
@@ -1169,6 +1174,5 @@ class FiringResultFreezeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_request(self) -> "FiringResultFreezeRequest":
-        _check_metric_names(self.limits)
-        _check_metric_names(self.targets)
+        _check_metric_constraints(self.limits, self.targets)
         return self
