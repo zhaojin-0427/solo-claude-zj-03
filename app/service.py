@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from . import blending, db, moisture, optimizer, slurry, variability
+from . import blending, db, firing, moisture, optimizer, slurry, variability
 from .chemistry import calc_batch, deviation_summary, validate_analysis
 from .config import (
     CONSTANTS_VERSION,
@@ -21,6 +21,13 @@ from .schemas import (
     BatchRequest,
     BlendExperimentRequest,
     BlendFreezeRequest,
+    FiringCopyRequest,
+    FiringFinalizeRequest,
+    FiringFitRequest,
+    FiringResultFreezeRequest,
+    FiringSearchRequest,
+    FiringStudyCreate,
+    FiringTileCreate,
     FreezeRequest,
     MasterPlanRequest,
     MaterialCreate,
@@ -1770,4 +1777,386 @@ def finalize_slurry_batch(batch_id: str, req: SlurryFinalizeRequest | None = Non
         snapshot=snapshot,
     )
     db.update_slurry_status(batch["id"], "finalized", freeze_id=stored["id"])
+    return stored, created
+
+
+# ---------------------------------------------------------------------------
+# 烧成试片研究（草稿 -> 定稿只读 -> 复制新版补测）
+# ---------------------------------------------------------------------------
+
+def _firing_cells(
+    study: dict, experiment: dict
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """把研究试片按格位分组并附上布局比例。
+
+    返回 (有试片的格位列表, 布局内无试片的格位标签)。
+    """
+    weights_by_pos = {
+        cell["position"]: [float(w) for w in cell["weights"]]
+        for cell in experiment["layout"]
+    }
+    tiles = db.list_firing_tiles(study["id"])
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for tile in tiles:
+        grouped.setdefault(tile["position"], []).append(tile)
+    # weights_by_pos 按布局顺序构建，迭代即布局顺序
+    cells = [
+        {"position": pos, "weights": weights_by_pos[pos], "tiles": grouped[pos]}
+        for pos in weights_by_pos
+        if pos in grouped
+    ]
+    unmeasured = [pos for pos in weights_by_pos if pos not in grouped]
+    return cells, unmeasured
+
+
+def assemble_firing_study(study: dict) -> dict[str, Any]:
+    """组装研究完整视图：窑次信息、逐格试片与统计汇总。"""
+    experiment = db.get_blend_experiment(study["experiment_id"])
+    cells, unmeasured = _firing_cells(study, experiment)
+    tiles = db.list_firing_tiles(study["id"])
+    return {
+        "id": study["id"],
+        "experiment_id": study["experiment_id"],
+        "mode": experiment["mode"],
+        "sources": [s["version_id"] for s in experiment["sources"]],
+        "kiln_run": study["kiln_run"],
+        "status": study["status"],
+        "version_no": study["version_no"],
+        "parent_id": study["parent_id"],
+        "root_id": study["root_id"],
+        "body": study["body"],
+        "firing_curve": study["firing_curve"],
+        "atmosphere": study["atmosphere"],
+        "kiln_position": study["kiln_position"],
+        "fired_on": study["fired_on"],
+        "note": study["note"],
+        "n_tiles": len(tiles),
+        "cells": firing.summarize_cells(cells),
+        "unmeasured_cells": unmeasured,
+        "tiles": tiles,
+        "freeze_id": study["freeze_id"],
+        "created_at": study["created_at"],
+        "updated_at": study["updated_at"],
+        "finalized_at": study["finalized_at"],
+    }
+
+
+def create_firing_study(req: FiringStudyCreate) -> dict[str, Any]:
+    """创建烧成试片研究草稿：一份冻结混合试验 + 一次窑次。"""
+    experiment = db.get_blend_experiment(req.experiment_id)  # 404
+    study_id = "fst_" + uuid.uuid4().hex
+    study = db.create_firing_study(
+        study_id=study_id,
+        experiment_id=experiment["id"],
+        kiln_run=req.kiln_run,
+        version_no=1,
+        parent_id=None,
+        root_id=study_id,
+        body=req.body,
+        firing_curve=[p.model_dump() for p in req.firing_curve],
+        atmosphere=req.atmosphere,
+        kiln_position=req.kiln_position,
+        fired_on=req.fired_on.isoformat() if req.fired_on else None,
+        note=req.note,
+    )
+    return assemble_firing_study(study)
+
+
+def _require_firing_status(study: dict, allowed: tuple[str, ...]) -> None:
+    if study["status"] not in allowed:
+        raise GlazeError(
+            f"研究当前状态为 {study['status']}，该操作仅允许 {list(allowed)} 状态",
+            "invalid_firing_status",
+            {"status": study["status"], "allowed": list(allowed)},
+        )
+
+
+def add_firing_tile(study_id: str, req: FiringTileCreate) -> dict[str, Any]:
+    """向草稿研究登记一片重复试片（格位须属来源试验布局）。"""
+    study = db.get_firing_study(study_id)  # 404
+    _require_firing_status(study, ("draft",))
+    experiment = db.get_blend_experiment(study["experiment_id"])
+    positions = {cell["position"] for cell in experiment["layout"]}
+    if req.position not in positions:
+        raise GlazeError(
+            f"格位 {req.position} 不在来源试验布局中: {sorted(positions)}",
+            "unknown_cell_position",
+            {"position": req.position, "layout": sorted(positions)},
+        )
+    tile, _created = db.add_firing_tile(
+        study_id,
+        {
+            "position": req.position,
+            "replicate_no": req.replicate_no,
+            "l_star": req.l_star,
+            "a_star": req.a_star,
+            "b_star": req.b_star,
+            "gloss60": req.gloss60,
+            "thickness_mm": req.thickness_mm,
+            "pinhole": req.pinhole,
+            "crawling": req.crawling,
+            "running": req.running,
+            "note": req.note,
+        },
+    )
+    return {"tile": tile, "study": assemble_firing_study(db.get_firing_study(study_id))}
+
+
+def delete_firing_tile(study_id: str, tile_id: int) -> dict[str, Any]:
+    """从草稿研究删除一片试片。"""
+    study = db.get_firing_study(study_id)  # 404
+    _require_firing_status(study, ("draft",))
+    db.delete_firing_tile(study_id, tile_id)
+    return assemble_firing_study(db.get_firing_study(study_id))
+
+
+def finalize_firing_study(
+    study_id: str, req: Optional[FiringFinalizeRequest] = None
+):
+    """定稿：冻结窑次信息、全部试片测量与逐格统计。重复定稿返回同一结果。"""
+    study = db.get_firing_study(study_id)  # 404
+    if study["status"] == "finalized" and study.get("freeze_id"):
+        return db.get_firing_freeze(study["freeze_id"]), False
+    _require_firing_status(study, ("draft",))
+    experiment = db.get_blend_experiment(study["experiment_id"])
+    cells, unmeasured = _firing_cells(study, experiment)
+    if not cells:
+        raise GlazeError(
+            "研究内没有任何试片测量，无法定稿", "empty_firing_study"
+        )
+    tiles = db.list_firing_tiles(study_id)
+    final_state = {
+        "n_tiles": len(tiles),
+        "n_cells_measured": len(cells),
+        "unmeasured_cells": unmeasured,
+        "cells": firing.summarize_cells(cells),
+    }
+    snapshot = {
+        "study": {
+            "id": study["id"],
+            "version_no": study["version_no"],
+            "parent_id": study["parent_id"],
+            "root_id": study["root_id"],
+            "kiln_run": study["kiln_run"],
+            "body": study["body"],
+            "firing_curve": study["firing_curve"],
+            "atmosphere": study["atmosphere"],
+            "kiln_position": study["kiln_position"],
+            "fired_on": study["fired_on"],
+        },
+        "experiment": {
+            "id": experiment["id"],
+            "mode": experiment["mode"],
+            "sources": experiment["sources"],
+            "layout": experiment["layout"],
+            "setup": experiment["setup"],
+        },
+        "tiles": tiles,
+        "constants_version": CONSTANTS_VERSION,
+        "constants_snapshot": constants_snapshot(),
+        "note": req.note if req is not None else study["note"],
+    }
+    freeze_id = "fsf_" + _canonical_hash(
+        {"study_id": study["id"], "final_state": final_state, "snapshot": snapshot}
+    )
+    stored, created = db.save_firing_freeze(
+        freeze_id=freeze_id,
+        study_id=study["id"],
+        note=req.note if req is not None else study["note"],
+        final_state=final_state,
+        snapshot=snapshot,
+    )
+    db.update_firing_study_status(study["id"], "finalized", freeze_id=stored["id"])
+    return stored, created
+
+
+def copy_firing_study(study_id: str, req: Optional[FiringCopyRequest] = None):
+    """把已定稿研究复制为新版本草稿（补测用）：窑次信息与试片整体复制。"""
+    source = db.get_firing_study(study_id)  # 404
+    _require_firing_status(source, ("finalized",))
+    new_id = "fst_" + uuid.uuid4().hex
+    version_no = db.firing_lineage_max_version(source["root_id"]) + 1
+    note = req.note if req is not None else source["note"]
+    db.create_firing_study(
+        study_id=new_id,
+        experiment_id=source["experiment_id"],
+        kiln_run=source["kiln_run"],
+        version_no=version_no,
+        parent_id=source["id"],
+        root_id=source["root_id"],
+        body=source["body"],
+        firing_curve=source["firing_curve"],
+        atmosphere=source["atmosphere"],
+        kiln_position=source["kiln_position"],
+        fired_on=source["fired_on"],
+        note=note,
+    )
+    for tile in db.list_firing_tiles(source["id"]):
+        db.add_firing_tile(new_id, tile)
+    return assemble_firing_study(db.get_firing_study(new_id))
+
+
+def _fit_response(
+    study: dict, experiment: dict, fit: "firing.SurfaceFit"
+) -> dict[str, Any]:
+    return {
+        "study_id": study["id"],
+        "experiment_id": experiment["id"],
+        "mode": experiment["mode"],
+        "model_order": fit.order,
+        "terms": fit.terms,
+        "n_cells": len(fit.design_cells),
+        "n_tiles": fit.n_tiles,
+        "df": fit.df,
+        "t_crit_95": fit.t_crit,
+        "design": {
+            "cells": fit.design_cells,
+            "unmeasured_cells": fit.unmeasured_cells,
+        },
+        "metrics": fit.metrics,
+        "defect_rates": fit.defect_rates,
+        "metric_labels": firing.METRIC_LABELS,
+        "constants_version": CONSTANTS_VERSION,
+    }
+
+
+def _fit_study(
+    study: dict, req: FiringFitRequest
+) -> tuple[dict, "firing.SurfaceFit"]:
+    experiment = db.get_blend_experiment(study["experiment_id"])
+    cells, unmeasured = _firing_cells(study, experiment)
+    fit = firing.fit_surfaces(
+        cells,
+        req.model_order,
+        outlier_threshold=req.outlier_threshold,
+        unmeasured_cells=unmeasured,
+    )
+    return experiment, fit
+
+
+def fit_firing_study(study_id: str, req: FiringFitRequest) -> dict[str, Any]:
+    """拟合 Scheffé 响应面（只读计算，草稿与定稿研究均可）。"""
+    study = db.get_firing_study(study_id)  # 404
+    experiment, fit = _fit_study(study, req)
+    return _fit_response(study, experiment, fit)
+
+
+def _resolve_ratio_step(experiment: dict, override: Optional[float]) -> float:
+    setup = experiment["setup"]
+    step = override if override is not None else setup.get("ratio_step")
+    if step is None:
+        raise GlazeError(
+            "来源试验未设定比例步长，请在请求中显式给出 ratio_step",
+            "ratio_step_missing",
+        )
+    return float(step)
+
+
+def _search_constraints_dict(req) -> dict[str, Any]:
+    return json.loads(req.model_dump_json())
+
+
+def search_firing_ratios(
+    study_id: str, req: FiringSearchRequest
+) -> dict[str, Any]:
+    """在原比例范围及步长网格内搜索配比并排序（只读计算）。"""
+    study = db.get_firing_study(study_id)  # 404
+    fit_req = FiringFitRequest(model_order=req.model_order)
+    experiment, fit = _fit_study(study, fit_req)
+    step = _resolve_ratio_step(experiment, req.ratio_step)
+    setup = experiment["setup"]
+    result = firing.search_ratios(
+        fit,
+        ratio_low=float(setup["ratio_low"]),
+        ratio_high=float(setup["ratio_high"]),
+        step=step,
+        limits=dict(req.limits),
+        targets={k: v.model_dump() for k, v in req.targets.items()},
+        max_candidates=req.max_candidates,
+    )
+    result["study_id"] = study["id"]
+    result["model_order"] = req.model_order
+    result["search_constraints"] = _search_constraints_dict(req)
+    result["constants_version"] = CONSTANTS_VERSION
+    return result
+
+
+def freeze_firing_result(study_id: str, req: FiringResultFreezeRequest):
+    """冻结选定配比结果：来源试验、试片数据、拟合选项与输入哈希整体存档。
+
+    研究须已定稿（试片数据只读）；重跑确定性拟合与搜索取 candidate_index，
+    后续窑次不会改写该记录。
+    """
+    study = db.get_firing_study(study_id)  # 404
+    _require_firing_status(study, ("finalized",))
+    fit_req = FiringFitRequest(model_order=req.model_order)
+    experiment, fit = _fit_study(study, fit_req)
+    step = _resolve_ratio_step(experiment, req.ratio_step)
+    setup = experiment["setup"]
+    result = firing.search_ratios(
+        fit,
+        ratio_low=float(setup["ratio_low"]),
+        ratio_high=float(setup["ratio_high"]),
+        step=step,
+        limits=dict(req.limits),
+        targets={k: v.model_dump() for k, v in req.targets.items()},
+        max_candidates=max(req.candidate_index + 1, req.max_candidates),
+    )
+    candidates = result["candidates"]
+    if req.candidate_index >= len(candidates):
+        raise GlazeError(
+            f"候选序号 {req.candidate_index} 超出范围（共 {len(candidates)} 个候选）",
+            "candidate_index_out_of_range",
+            {"candidate_index": req.candidate_index, "n_candidates": len(candidates)},
+        )
+    selected = candidates[req.candidate_index]
+
+    fit_options = {
+        "model_order": req.model_order,
+        "outlier_threshold": fit_req.outlier_threshold,
+        "terms": fit.terms,
+    }
+    search_constraints = _search_constraints_dict(req)
+    tiles = db.list_firing_tiles(study["id"])
+    source_snapshot = {
+        "experiment": {
+            "id": experiment["id"],
+            "mode": experiment["mode"],
+            "sources": experiment["sources"],
+            "layout": experiment["layout"],
+            "setup": experiment["setup"],
+        },
+        "study": {
+            "id": study["id"],
+            "freeze_id": study["freeze_id"],
+            "version_no": study["version_no"],
+            "kiln_run": study["kiln_run"],
+            "body": study["body"],
+            "firing_curve": study["firing_curve"],
+            "atmosphere": study["atmosphere"],
+            "kiln_position": study["kiln_position"],
+            "fired_on": study["fired_on"],
+        },
+        "tiles": tiles,
+        "fit": _fit_response(study, experiment, fit),
+        "constants_version": CONSTANTS_VERSION,
+        "constants_snapshot": constants_snapshot(),
+    }
+    hash_payload = {
+        "study_id": study["id"],
+        "study_freeze_id": study["freeze_id"],
+        "fit_options": fit_options,
+        "search_constraints": search_constraints,
+        "selected": selected,
+        "source": source_snapshot,
+    }
+    stored, created = db.save_firing_result_freeze(
+        input_hash=_canonical_hash(hash_payload),
+        study_id=study["id"],
+        note=req.note,
+        fit_options=fit_options,
+        search_constraints=search_constraints,
+        selected=selected,
+        source_snapshot=source_snapshot,
+    )
     return stored, created

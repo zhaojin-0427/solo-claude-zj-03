@@ -155,6 +155,65 @@ CREATE TABLE IF NOT EXISTS slurry_freezes (
     snapshot    TEXT NOT NULL,          -- 投料/读数/调整/计算常量完整快照
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS firing_studies (
+    id              TEXT PRIMARY KEY,   -- fst_<uuid>
+    experiment_id   TEXT NOT NULL,      -- 来源冻结混合试验
+    kiln_run        TEXT NOT NULL,      -- 窑次标签
+    status          TEXT NOT NULL,      -- draft / finalized
+    version_no      INTEGER NOT NULL,   -- 谱系内版本号（复制补测递增）
+    parent_id       TEXT,               -- 复制来源研究 id
+    root_id         TEXT NOT NULL,      -- 谱系根研究 id
+    body            TEXT NOT NULL,      -- 坯体
+    firing_curve    TEXT NOT NULL,      -- JSON: [{time_min, temp_c}]
+    atmosphere      TEXT,
+    kiln_position   TEXT NOT NULL,      -- 窑位
+    fired_on        TEXT,               -- 烧成日期
+    note            TEXT,
+    freeze_id       TEXT,               -- 定稿后指向 firing_freezes.id
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    finalized_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS firing_tiles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id        TEXT NOT NULL,      -- 所属研究
+    position        TEXT NOT NULL,      -- 格位（来源试验布局）
+    replicate_no    INTEGER NOT NULL,   -- 格内重复编号（从 1 起）
+    l_star          REAL NOT NULL,
+    a_star          REAL NOT NULL,
+    b_star          REAL NOT NULL,
+    gloss60         REAL NOT NULL,      -- 60° 光泽度（GU）
+    thickness_mm    REAL NOT NULL,      -- 烧后厚度（mm）
+    pinhole         INTEGER NOT NULL,   -- 针孔等级 0~3
+    crawling        INTEGER NOT NULL,   -- 缩釉等级 0~3
+    running         INTEGER NOT NULL,   -- 流釉等级 0~3
+    note            TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (study_id, position, replicate_no)
+);
+
+CREATE TABLE IF NOT EXISTS firing_freezes (
+    id          TEXT PRIMARY KEY,       -- fsf_<hash>
+    study_id    TEXT NOT NULL UNIQUE,   -- 一研究只能定稿一次，重复定稿取旧记录
+    note        TEXT,
+    final_state TEXT NOT NULL,          -- 定稿时逐格统计汇总
+    snapshot    TEXT NOT NULL,          -- 试验/窑次/试片/常量完整快照
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS firing_result_freezes (
+    id                 TEXT PRIMARY KEY,  -- input_hash
+    input_hash         TEXT NOT NULL UNIQUE,
+    study_id           TEXT NOT NULL,     -- 来源研究（须已定稿）
+    note               TEXT,
+    fit_options        TEXT NOT NULL,     -- 拟合选项（模型阶次/异常阈值）
+    search_constraints TEXT NOT NULL,     -- 上限/目标窗口/步长/候选序号
+    selected           TEXT NOT NULL,     -- 选定配比与全部指标预测
+    source_snapshot    TEXT NOT NULL,     -- 来源试验+试片数据+拟合结果快照
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1009,4 +1068,343 @@ def _slurry_freeze_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["final_state"] = json.loads(data["final_state"])
     data["snapshot"] = json.loads(data["snapshot"])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 烧成试片研究（草稿可变；定稿后只读，补测须复制新版）
+# ---------------------------------------------------------------------------
+
+def create_firing_study(
+    *,
+    study_id: str,
+    experiment_id: str,
+    kiln_run: str,
+    version_no: int,
+    parent_id: Optional[str],
+    root_id: str,
+    body: str,
+    firing_curve: list[dict[str, Any]],
+    atmosphere: Optional[str],
+    kiln_position: str,
+    fired_on: Optional[str],
+    note: Optional[str],
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO firing_studies
+                   (id, experiment_id, kiln_run, status, version_no,
+                    parent_id, root_id, body, firing_curve, atmosphere,
+                    kiln_position, fired_on, note)
+               VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                experiment_id,
+                kiln_run,
+                version_no,
+                parent_id,
+                root_id,
+                body,
+                json.dumps(firing_curve, sort_keys=True, ensure_ascii=False),
+                atmosphere,
+                kiln_position,
+                fired_on,
+                note,
+            ),
+        )
+    return get_firing_study(study_id)
+
+
+def get_firing_study(study_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM firing_studies WHERE id = ?", (study_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"烧成试片研究不存在: {study_id}", "firing_study_not_found"
+        )
+    return _firing_study_row_to_dict(row)
+
+
+def list_firing_studies(limit: int = 50) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM firing_studies ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_firing_study_row_to_dict(r) for r in rows]
+
+
+def firing_lineage_max_version(root_id: str) -> int:
+    """谱系（同一根研究及其全部复制版本）内的最大版本号。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version_no), 0) AS max_v FROM firing_studies "
+            "WHERE root_id = ?",
+            (root_id,),
+        ).fetchone()
+    return int(row["max_v"])
+
+
+def update_firing_study_status(
+    study_id: str, status: str, freeze_id: Optional[str] = None
+) -> None:
+    with get_conn() as conn:
+        if status == "finalized":
+            conn.execute(
+                """UPDATE firing_studies
+                   SET status=?, freeze_id=?,
+                       finalized_at=datetime('now'), updated_at=datetime('now')
+                   WHERE id=?""",
+                (status, freeze_id, study_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE firing_studies SET status=?, updated_at=datetime('now') "
+                "WHERE id=?",
+                (status, study_id),
+            )
+
+
+def _firing_study_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["firing_curve"] = json.loads(data["firing_curve"])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 烧成试片（草稿期可增删；定稿后随研究只读）
+# ---------------------------------------------------------------------------
+
+def _firing_tile_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def add_firing_tile(
+    study_id: str, tile: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """登记一片重复试片；同格位同重复编号已存在则幂等返回旧记录。
+
+    重复编号相同但测量值不同视为冲突，抛出 :class:`GlazeError`。
+    """
+    from .errors import GlazeError
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            """SELECT * FROM firing_tiles
+               WHERE study_id = ? AND position = ? AND replicate_no = ?""",
+            (study_id, tile["position"], tile["replicate_no"]),
+        ).fetchone()
+        if existing is not None:
+            old = _firing_tile_row_to_dict(existing)
+            same = all(
+                old[k] == tile[k]
+                for k in (
+                    "l_star", "a_star", "b_star", "gloss60", "thickness_mm",
+                    "pinhole", "crawling", "running",
+                )
+            )
+            if same:
+                return old, False
+            raise GlazeError(
+                f"格位 {tile['position']} 的重复编号 {tile['replicate_no']} "
+                "已存在且测量值不同，请改用新的重复编号",
+                "duplicate_replicate",
+                {
+                    "position": tile["position"],
+                    "replicate_no": tile["replicate_no"],
+                    "existing_tile_id": old["id"],
+                },
+            )
+        cur = conn.execute(
+            """INSERT INTO firing_tiles
+                   (study_id, position, replicate_no, l_star, a_star, b_star,
+                    gloss60, thickness_mm, pinhole, crawling, running, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                study_id,
+                tile["position"],
+                tile["replicate_no"],
+                tile["l_star"],
+                tile["a_star"],
+                tile["b_star"],
+                tile["gloss60"],
+                tile["thickness_mm"],
+                tile["pinhole"],
+                tile["crawling"],
+                tile["running"],
+                tile.get("note"),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM firing_tiles WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _firing_tile_row_to_dict(row), True
+
+
+def list_firing_tiles(study_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM firing_tiles WHERE study_id = ? "
+            "ORDER BY position, replicate_no, id",
+            (study_id,),
+        ).fetchall()
+    return [_firing_tile_row_to_dict(r) for r in rows]
+
+
+def delete_firing_tile(study_id: str, tile_id: int) -> None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM firing_tiles WHERE study_id = ? AND id = ?",
+            (study_id, tile_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"试片不存在: study={study_id} tile={tile_id}",
+                "firing_tile_not_found",
+            )
+        conn.execute(
+            "DELETE FROM firing_tiles WHERE study_id = ? AND id = ?",
+            (study_id, tile_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 烧成研究定稿快照（不可变）
+# ---------------------------------------------------------------------------
+
+def save_firing_freeze(
+    *,
+    freeze_id: str,
+    study_id: str,
+    note: Optional[str],
+    final_state: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """定稿冻结；同研究已有冻结记录则直接返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM firing_freezes WHERE study_id = ?", (study_id,)
+        ).fetchone()
+        if existing is not None:
+            return _firing_freeze_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO firing_freezes (id, study_id, note, final_state, snapshot)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                freeze_id,
+                study_id,
+                note,
+                json.dumps(final_state, sort_keys=True, ensure_ascii=False),
+                json.dumps(snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM firing_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    return _firing_freeze_row_to_dict(row), True
+
+
+def get_firing_freeze(freeze_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM firing_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"烧成研究定稿冻结不存在: {freeze_id}", "firing_freeze_not_found"
+        )
+    return _firing_freeze_row_to_dict(row)
+
+
+def find_firing_freeze(study_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM firing_freezes WHERE study_id = ?", (study_id,)
+        ).fetchone()
+    return _firing_freeze_row_to_dict(row) if row is not None else None
+
+
+def _firing_freeze_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["final_state"] = json.loads(data["final_state"])
+    data["snapshot"] = json.loads(data["snapshot"])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 烧成配比结果冻结（不可变）
+# ---------------------------------------------------------------------------
+
+def save_firing_result_freeze(
+    *,
+    input_hash: str,
+    study_id: str,
+    note: Optional[str],
+    fit_options: dict[str, Any],
+    search_constraints: dict[str, Any],
+    selected: dict[str, Any],
+    source_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """写入配比结果冻结记录；同 hash 已存在则直接返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM firing_result_freezes WHERE input_hash = ?",
+            (input_hash,),
+        ).fetchone()
+        if existing is not None:
+            return _firing_result_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO firing_result_freezes
+                   (id, input_hash, study_id, note, fit_options,
+                    search_constraints, selected, source_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                input_hash,
+                input_hash,
+                study_id,
+                note,
+                json.dumps(fit_options, sort_keys=True, ensure_ascii=False),
+                json.dumps(search_constraints, sort_keys=True, ensure_ascii=False),
+                json.dumps(selected, sort_keys=True, ensure_ascii=False),
+                json.dumps(source_snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM firing_result_freezes WHERE input_hash = ?",
+            (input_hash,),
+        ).fetchone()
+    return _firing_result_row_to_dict(row), True
+
+
+def get_firing_result_freeze(freeze_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM firing_result_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"烧成配比结果冻结不存在: {freeze_id}",
+            "firing_result_freeze_not_found",
+        )
+    return _firing_result_row_to_dict(row)
+
+
+def list_firing_result_freezes(
+    study_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM firing_result_freezes WHERE study_id = ? "
+            "ORDER BY created_at DESC, id LIMIT ?",
+            (study_id, limit),
+        ).fetchall()
+    return [_firing_result_row_to_dict(r) for r in rows]
+
+
+def _firing_result_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    for key in ("fit_options", "search_constraints", "selected", "source_snapshot"):
+        data[key] = json.loads(data[key])
     return data

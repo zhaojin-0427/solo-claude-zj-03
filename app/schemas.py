@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .config import (
     DEFAULT_N_RESAMPLES,
     DEFAULT_STUDY_SEED,
+    FIRING_MAX_DEFECT_GRADE,
     MAX_RESAMPLES,
     MIN_RESAMPLES,
     OXIDE_CATALOG,
@@ -976,3 +977,198 @@ class SlurryFinalizeRequest(BaseModel):
     """定稿请求（可选备注）；定稿幂等，重复提交返回同一冻结结果。"""
 
     note: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 烧成试片研究
+# ---------------------------------------------------------------------------
+
+_FIRING_METRICS = (
+    "l_star", "a_star", "b_star", "gloss60", "thickness_mm",
+    "pinhole_rate", "crawling_rate", "running_rate",
+)
+
+
+class FiringCurvePoint(BaseModel):
+    """烧成曲线上的一个控温点。"""
+
+    time_min: float = Field(..., ge=0.0, description="距点火时间（分钟）")
+    temp_c: float = Field(..., ge=-50.0, le=1800.0, description="炉温（°C）")
+
+
+class FiringStudyCreate(BaseModel):
+    """创建烧成试片研究：一份冻结混合试验 + 一次窑次构成独立版本（草稿）。"""
+
+    experiment_id: str = Field(min_length=1, description="来源冻结混合试验 id")
+    kiln_run: str = Field(min_length=1, max_length=64, description="窑次标签")
+    body: str = Field(min_length=1, max_length=64, description="坯体名称")
+    firing_curve: list[FiringCurvePoint] = Field(
+        min_length=1, description="烧成曲线控温点（时间须严格递增）"
+    )
+    atmosphere: Optional[str] = Field(
+        default=None, max_length=32, description="烧成气氛（如 氧化/还原）"
+    )
+    kiln_position: str = Field(
+        min_length=1, max_length=64, description="窑位（试片在窑内位置）"
+    )
+    fired_on: Optional[date] = Field(default=None, description="烧成日期")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "FiringStudyCreate":
+        for attr in ("kiln_run", "body", "kiln_position"):
+            value = getattr(self, attr)
+            if not value.strip():
+                raise GlazeError(
+                    f"{attr} 不得为空白", "blank_field", {"field": attr}
+                )
+            setattr(self, attr, value.strip())
+        times = [p.time_min for p in self.firing_curve]
+        if any(b <= a for a, b in zip(times, times[1:])):
+            raise GlazeError(
+                "烧成曲线的时间必须严格递增",
+                "invalid_firing_curve",
+                {"times_min": times},
+            )
+        return self
+
+
+class FiringTileCreate(BaseModel):
+    """登记一片重复试片的完整测量（各字段必填，保证测量完整性）。"""
+
+    position: str = Field(min_length=1, max_length=64, description="格位标签")
+    replicate_no: int = Field(..., ge=1, le=999, description="格内重复编号（从 1 起）")
+    l_star: float = Field(..., ge=0.0, le=100.0, description="L*（CIELAB 明度）")
+    a_star: float = Field(..., ge=-150.0, le=150.0, description="a*（红绿）")
+    b_star: float = Field(..., ge=-150.0, le=150.0, description="b*（黄蓝）")
+    gloss60: float = Field(..., ge=0.0, le=1000.0, description="60° 光泽度（GU）")
+    thickness_mm: float = Field(..., gt=0.0, le=50.0, description="烧后厚度（mm）")
+    pinhole: int = Field(
+        ..., ge=0, le=FIRING_MAX_DEFECT_GRADE, description="针孔等级 0~3"
+    )
+    crawling: int = Field(
+        ..., ge=0, le=FIRING_MAX_DEFECT_GRADE, description="缩釉等级 0~3"
+    )
+    running: int = Field(
+        ..., ge=0, le=FIRING_MAX_DEFECT_GRADE, description="流釉等级 0~3"
+    )
+    thickness_unit: Literal["mm"] = Field(
+        default="mm", description="厚度单位（仅支持 mm）"
+    )
+    gloss_unit: Literal["GU60"] = Field(
+        default="GU60", description="光泽度单位（仅支持 60° GU）"
+    )
+    note: Optional[str] = None
+
+
+class FiringFinalizeRequest(BaseModel):
+    """定稿请求（可选备注）；定稿幂等，重复提交返回同一冻结结果。"""
+
+    note: Optional[str] = None
+
+
+class FiringCopyRequest(BaseModel):
+    """把已定稿研究复制为新版本草稿（补测用），可覆盖备注。"""
+
+    note: Optional[str] = None
+
+
+class FiringFitRequest(BaseModel):
+    """Scheffé 响应面拟合选项。"""
+
+    model_order: Literal[1, 2] = Field(
+        default=2, description="1=一次 Scheffé / 2=二次 Scheffé"
+    )
+    outlier_threshold: float = Field(
+        default=2.5, gt=0.0, description="异常试片学生化残差阈值"
+    )
+
+
+class FiringMetricTarget(BaseModel):
+    """单指标目标窗口（用于排序键"目标中心偏差"）。"""
+
+    low: float = Field(..., description="目标下限")
+    high: float = Field(..., description="目标上限")
+    weight: float = Field(default=1.0, gt=0.0, description="偏差权重")
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "FiringMetricTarget":
+        if self.low > self.high:
+            raise GlazeError(
+                f"目标区间矛盾: low={self.low} > high={self.high}",
+                "contradictory_bounds",
+                {"low": self.low, "high": self.high},
+            )
+        return self
+
+
+def _check_metric_names(names: dict) -> dict:
+    unknown = sorted(set(names) - set(_FIRING_METRICS))
+    if unknown:
+        raise GlazeError(
+            f"未知指标: {', '.join(unknown)}",
+            "unknown_metric",
+            {"unknown": unknown, "known": list(_FIRING_METRICS)},
+        )
+    return names
+
+
+class FiringSearchRequest(BaseModel):
+    """配比搜索：上限约束 + 可选目标窗口 + 比例步长。"""
+
+    model_order: Literal[1, 2] = Field(default=2, description="拟合模型阶次")
+    limits: dict[str, float] = Field(
+        default_factory=dict,
+        description="各指标上限（颜色/光泽/厚度/缺陷发生率），预测值超出即违规",
+    )
+    targets: dict[str, FiringMetricTarget] = Field(
+        default_factory=dict,
+        description="各指标目标窗口（中点参与'目标中心偏差'排序）",
+    )
+    ratio_step: Optional[float] = Field(
+        default=None, gt=0.0, le=1.0,
+        description="比例步长（缺省沿用试验布局的 ratio_step）",
+    )
+    max_candidates: int = Field(default=10, ge=1, le=50, description="返回候选条数上限")
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "FiringSearchRequest":
+        _check_metric_names(self.limits)
+        _check_metric_names(self.targets)
+        for name, lim in self.limits.items():
+            if name.endswith("_rate") and not 0.0 <= lim <= 1.0:
+                raise GlazeError(
+                    f"缺陷发生率上限 {lim} 须在 [0, 1] 内",
+                    "invalid_rate_limit",
+                    {"metric": name, "limit": lim},
+                )
+        for name, spec in self.targets.items():
+            if name.endswith("_rate") and not (
+                0.0 <= spec.low <= 1.0 and 0.0 <= spec.high <= 1.0
+            ):
+                raise GlazeError(
+                    f"缺陷发生率目标窗口 [{spec.low}, {spec.high}] 须在 [0, 1] 内",
+                    "invalid_rate_target",
+                    {"metric": name},
+                )
+        return self
+
+
+class FiringResultFreezeRequest(BaseModel):
+    """冻结选定配比结果：重跑确定性拟合与搜索，取 candidate_index。"""
+
+    model_order: Literal[1, 2] = Field(default=2, description="拟合模型阶次")
+    limits: dict[str, float] = Field(default_factory=dict)
+    targets: dict[str, FiringMetricTarget] = Field(default_factory=dict)
+    ratio_step: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    max_candidates: int = Field(default=10, ge=1, le=50)
+    candidate_index: int = Field(
+        default=0, ge=0, description="搜索返回的候选序号（0 为 best）"
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "FiringResultFreezeRequest":
+        _check_metric_names(self.limits)
+        _check_metric_names(self.targets)
+        return self

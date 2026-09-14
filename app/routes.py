@@ -12,6 +12,13 @@ from .schemas import (
     BatchRequest,
     BlendExperimentRequest,
     BlendFreezeRequest,
+    FiringCopyRequest,
+    FiringFinalizeRequest,
+    FiringFitRequest,
+    FiringResultFreezeRequest,
+    FiringSearchRequest,
+    FiringStudyCreate,
+    FiringTileCreate,
     FreezeRequest,
     MasterPlanRequest,
     MaterialCreate,
@@ -346,3 +353,93 @@ def finalize_slurry_batch(
 @router.get("/slurry-freezes/{freeze_id}")
 def get_slurry_freeze(freeze_id: str) -> dict[str, Any]:
     return db.get_slurry_freeze(freeze_id)
+
+
+# ---------------------------------------------------------------------------
+# 烧成试片研究（草稿 -> 定稿只读 -> 复制新版补测；拟合/搜索/结果冻结）
+# ---------------------------------------------------------------------------
+
+@router.post("/firing-studies", status_code=201)
+def create_firing_study(req: FiringStudyCreate) -> dict[str, Any]:
+    """以一份冻结混合试验和一次窑次创建独立的烧成试片研究（草稿）。"""
+    return service.create_firing_study(req)
+
+
+@router.get("/firing-studies")
+def list_firing_studies(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    return [service.assemble_firing_study(s) for s in db.list_firing_studies(limit)]
+
+
+@router.get("/firing-studies/{study_id}")
+def get_firing_study(study_id: str) -> dict[str, Any]:
+    return service.assemble_firing_study(db.get_firing_study(study_id))
+
+
+@router.post("/firing-studies/{study_id}/tiles", status_code=201)
+def add_firing_tile(study_id: str, req: FiringTileCreate) -> dict[str, Any]:
+    """向草稿研究登记一片重复试片（完整测量；同编号同值幂等）。"""
+    return service.add_firing_tile(study_id, req)
+
+
+@router.delete("/firing-studies/{study_id}/tiles/{tile_id}")
+def remove_firing_tile(study_id: str, tile_id: int) -> dict[str, Any]:
+    """从草稿研究删除一片试片。"""
+    return service.delete_firing_tile(study_id, tile_id)
+
+
+@router.post("/firing-studies/{study_id}/finalize", status_code=201)
+def finalize_firing_study(
+    study_id: str, req: FiringFinalizeRequest | None = None
+) -> dict[str, Any]:
+    """定稿冻结窑次信息与全部试片；重复定稿返回同一结果（created=False）。"""
+    payload = req if req is not None else FiringFinalizeRequest.model_validate({})
+    stored, created = service.finalize_firing_study(study_id, payload)
+    return {"created": created, "freeze": stored}
+
+
+@router.post("/firing-studies/{study_id}/copy", status_code=201)
+def copy_firing_study(
+    study_id: str, req: FiringCopyRequest | None = None
+) -> dict[str, Any]:
+    """把已定稿研究复制为新版本草稿（补测用），版本号在谱系内递增。"""
+    payload = req if req is not None else FiringCopyRequest.model_validate({})
+    return service.copy_firing_study(study_id, payload)
+
+
+@router.post("/firing-studies/{study_id}/fit")
+def fit_firing_study(study_id: str, req: FiringFitRequest) -> dict[str, Any]:
+    """拟合一次/二次 Scheffé 响应面并统计缺陷发生率（只读计算）。"""
+    return service.fit_firing_study(study_id, req)
+
+
+@router.post("/firing-studies/{study_id}/search")
+def search_firing_ratios(study_id: str, req: FiringSearchRequest) -> dict[str, Any]:
+    """在原比例范围及步长网格内搜索配比，按违规数/不确定度/中心偏差排序。"""
+    return service.search_firing_ratios(study_id, req)
+
+
+@router.post("/firing-studies/{study_id}/result-freezes", status_code=201)
+def freeze_firing_result(
+    study_id: str, req: FiringResultFreezeRequest
+) -> dict[str, Any]:
+    """冻结选定配比结果：来源试验、试片数据、拟合选项与输入哈希整体存档。"""
+    stored, created = service.freeze_firing_result(study_id, req)
+    return {"created": created, "freeze": stored}
+
+
+@router.get("/firing-studies/{study_id}/result-freezes")
+def list_firing_result_freezes(
+    study_id: str, limit: int = Query(50, ge=1, le=500)
+) -> list[dict]:
+    db.get_firing_study(study_id)  # 404: 研究不存在
+    return db.list_firing_result_freezes(study_id, limit)
+
+
+@router.get("/firing-freezes/{freeze_id}")
+def get_firing_freeze(freeze_id: str) -> dict[str, Any]:
+    return db.get_firing_freeze(freeze_id)
+
+
+@router.get("/firing-result-freezes/{freeze_id}")
+def get_firing_result_freeze(freeze_id: str) -> dict[str, Any]:
+    return db.get_firing_result_freeze(freeze_id)

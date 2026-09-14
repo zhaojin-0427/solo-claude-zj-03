@@ -89,6 +89,12 @@ TOP_VIOLATION_COMBOS = 5       # 结果中返回的常见越界组合条数
 DENSITY_CLOSURE_TOLERANCE_G_ML = 0.02  # 比重杯实测与理论比重的闭合容差（g/mL）
 CORRECTION_MAX_GRID_COMBOS = 200_000   # 纠偏网格枚举组合数上限
 
+# 烧成试片研究参数
+FIRING_MAX_DEFECT_GRADE = 3        # 缺陷等级上限（0=无，3=严重）
+FIRING_OUTLIER_THRESHOLD = 2.5     # 异常试片判定的学生化残差阈值
+FIRING_WILSON_Z = 1.96             # 缺陷发生率 Wilson 区间 z 值（95%）
+FIRING_MAX_GRID_POINTS = 100_000   # 配比搜索网格点数上限
+
 
 class Settings(BaseModel):
     db_path: str = str(Path(__file__).resolve().parent.parent / "glaze.db")
