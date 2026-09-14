@@ -1,15 +1,20 @@
-"""业务编排：直接计算、搜索替代配方、版本冻结、批次波动研究、混合试验。"""
+"""业务编排：直接计算、搜索替代配方、版本冻结、批次波动研究、混合试验、釉浆调制。"""
 from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from typing import Any
 
 import numpy as np
 
-from . import blending, db, optimizer, variability
+from . import blending, db, optimizer, slurry, variability
 from .chemistry import calc_batch, deviation_summary, validate_analysis
-from .config import CONSTANTS_VERSION, constants_snapshot
+from .config import (
+    CONSTANTS_VERSION,
+    DENSITY_CLOSURE_TOLERANCE_G_ML,
+    constants_snapshot,
+)
 from .errors import GlazeError
 from .schemas import (
     BatchRequest,
@@ -22,6 +27,14 @@ from .schemas import (
     RobustFreezeRequest,
     RobustSearchRequest,
     SearchRequest,
+    SlurryAdditionRequest,
+    SlurryBatchCreate,
+    SlurryCorrectionRequest,
+    SlurryFinalizeRequest,
+    SlurryPremixRequest,
+    SlurryReadingRequest,
+    SlurryRecycleRequest,
+    SlurryAdjustmentRequest,
     StudyRequest,
 )
 
@@ -814,3 +827,644 @@ def freeze_blend_plan(experiment_id: str, req: BlendFreezeRequest):
         plan=plan,
         source_snapshot=source_snapshot,
     )
+
+
+# ---------------------------------------------------------------------------
+# 釉浆调制批次
+# ---------------------------------------------------------------------------
+
+
+def _slurry_recipe_snapshot(version: dict) -> dict[str, Any]:
+    """从冻结版本提取釉浆批次需要的配方快照：份额 + 原料名。"""
+    totals: dict[int, float] = {}
+    for item in version["items"]:
+        amt = float(item["amount"])
+        if amt > 0.0:
+            mid = int(item["material_id"])
+            totals[mid] = totals.get(mid, 0.0) + amt
+    batch_mass = sum(totals.values())
+    if batch_mass <= 0.0:
+        raise GlazeError("来源配方没有任何正用量原料", "empty_batch")
+    materials = []
+    for mid in sorted(totals):
+        name = version["material_snapshot"][str(mid)]["name"]
+        materials.append(
+            {
+                "material_id": mid,
+                "name": name,
+                "amount_kg": round(totals[mid], 9),
+                "share": totals[mid] / batch_mass,
+            }
+        )
+    return {"version_id": version["id"], "materials": materials}
+
+
+def _initial_plan(
+    recipe: dict[str, Any], req: SlurryBatchCreate, rho_w: float
+) -> dict[str, Any]:
+    """按配方份额给各原料、初始用水、添加剂的初始称量值。
+
+    固含率定义 S = 干物 / (干物 + 水 + 添加剂)，初始取水取目标区间中点，
+    再按添加剂占干料比例反推初始用水。
+    """
+    target_solids = (req.solids_low + req.solids_high) / 2.0
+    dry_g = req.target_dry_mass_kg * 1000.0
+    additive_g = dry_g * req.additive_ratio
+    # dry / (dry + water + additive) = S  =>  water = dry/S - dry - additive
+    water_g = dry_g / target_solids - dry_g - additive_g
+    if water_g < -1e-9:
+        raise GlazeError(
+            "按目标固含率与添加剂比例反推的初始用水为负：添加剂占比过高，"
+            f"目标固含率 {target_solids:.4f} 无法同时容纳 {req.additive_ratio:.4f} "
+            "的添加剂比例",
+            "additive_ratio_infeasible",
+            {
+                "target_solids_fraction": target_solids,
+                "additive_ratio": req.additive_ratio,
+            },
+        )
+    water_g = max(water_g, 0.0)
+    lines = []
+    for m in recipe["materials"]:
+        mass_g = dry_g * m["share"]
+        lines.append(
+            {
+                "material_id": m["material_id"],
+                "name": m["name"],
+                "share": m["share"],
+                "mass_kg": round(mass_g / 1000.0, 9),
+                "mass_g": round(mass_g, 6),
+            }
+        )
+    volume_ml = (
+        dry_g / req.powder_true_density_kg_l
+        + (water_g + additive_g) / rho_w
+    )
+    return {
+        "target_solids_fraction": target_solids,
+        "target_dry_mass_g": dry_g,
+        "materials": lines,
+        "initial_water_g": round(water_g, 6),
+        "initial_water_kg": round(water_g / 1000.0, 9),
+        "initial_additive_g": round(additive_g, 6),
+        "initial_additive_kg": round(additive_g / 1000.0, 9),
+        "planned_volume_ml": round(volume_ml, 6),
+        "fits_container": volume_ml <= req.container_capacity_l * 1000.0 + 1e-9,
+    }
+
+
+def create_slurry_batch(req: SlurryBatchCreate):
+    version = db.get_version(req.version_id)  # 404
+    recipe = _slurry_recipe_snapshot(version)
+    rho_w = slurry.water_density(req.water_temp_c)
+    plan = _initial_plan(recipe, req, rho_w)
+    if not plan["fits_container"]:
+        raise GlazeError(
+            f"初始计划体积 {plan['planned_volume_ml']:.1f} mL 超出容器容量 "
+            f"{req.container_capacity_l * 1000.0:.1f} mL，无法按该干料量调制",
+            "planned_over_capacity",
+            {
+                "planned_volume_ml": plan["planned_volume_ml"],
+                "container_capacity_ml": req.container_capacity_l * 1000.0,
+            },
+        )
+    batch_id = "slb_" + uuid.uuid4().hex
+    params = {
+        "target_dry_mass_kg": req.target_dry_mass_kg,
+        "solids_low": req.solids_low,
+        "solids_high": req.solids_high,
+        "density_low": req.density_low,
+        "density_high": req.density_high,
+        "powder_true_density_kg_l": req.powder_true_density_kg_l,
+        "water_temp_c": req.water_temp_c,
+        "water_density_g_ml": rho_w,
+        "container_capacity_ml": req.container_capacity_l * 1000.0,
+        "additive_ratio": req.additive_ratio,
+        "note": req.note,
+    }
+    batch = db.create_slurry_batch(
+        batch_id=batch_id,
+        version_id=version["id"],
+        params=params,
+        initial_plan=plan,
+        recipe_snapshot=recipe,
+    )
+    return assemble_slurry_batch(batch)
+
+
+def _new_state() -> slurry.SlurryState:
+    return slurry.SlurryState()
+
+
+def _state_breakdown(state: slurry.SlurryState) -> dict[str, dict[str, float]]:
+    return {
+        "dry_g": {
+            "direct": round(state.dry_direct_g, 9),
+            "premix": round(state.dry_premix_g, 9),
+            "recycle": round(state.dry_recycle_g, 9),
+        },
+        "water_g": {
+            "direct": round(state.water_direct_g, 9),
+            "recycle": round(state.water_recycle_g, 9),
+        },
+        "additive_g": {
+            "direct": round(state.additive_direct_g, 9),
+            "recycle": round(state.additive_recycle_g, 9),
+        },
+    }
+
+
+def _replay(batch: dict, entries: list[dict]) -> slurry.SlurryState:
+    """按台账序号重放全部质量动作，重建三相累计。读数不改质量。"""
+    state = _new_state()
+    for entry in entries:
+        p = entry["payload"]
+        kind = entry["entry_type"]
+        if kind == "addition":
+            dry = sum(float(d["mass_g"]) for d in p["dry_materials"])
+            state.add_direct(dry, float(p["water_g"]), float(p["additive_g"]))
+        elif kind == "recycle":
+            state.add_recycle(
+                float(p["split"]["dry_g"]),
+                float(p["split"]["water_g"]),
+                float(p["split"]["additive_g"]),
+            )
+        elif kind == "premix":
+            state.add_premix(float(p["premix_mass_g"]), float(p.get("water_g", 0.0)))
+        elif kind == "adjustment":
+            state.add_premix(float(p["premix_g"]), float(p["water_g"]))
+        # reading 不改变质量
+    return state
+
+
+def _target_status(metrics: dict, batch: dict) -> dict[str, Any]:
+    solids = metrics["solids_fraction"]
+    density = metrics["theoretical_density_g_ml"]
+    solids_dev = max(
+        batch["solids_low"] - solids, 0.0, solids - batch["solids_high"]
+    )
+    density_dev = max(
+        batch["density_low"] - density, 0.0, density - batch["density_high"]
+    )
+    return {
+        "solids": {
+            "value": round(solids, 9),
+            "low": batch["solids_low"],
+            "high": batch["solids_high"],
+            "deviation": round(solids_dev, 12),
+            "in_range": solids_dev <= 0.0,
+        },
+        "density": {
+            "value": round(density, 9),
+            "low": batch["density_low"],
+            "high": batch["density_high"],
+            "deviation": round(density_dev, 12),
+            "in_range": density_dev <= 0.0,
+        },
+        "all_targets_met": solids_dev <= 0.0 and density_dev <= 0.0,
+    }
+
+
+def _build_warnings(
+    batch: dict, entries: list[dict], metrics: dict
+) -> list[dict[str, Any]]:
+    """汇总当前批次的异常：读数不闭合、容器超量、目标越界。"""
+    warnings: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry["entry_type"] != "reading":
+            continue
+        assessment = entry.get("state_after") or {}
+        if not assessment.get("closed"):
+            warnings.append(
+                {
+                    "code": "reading_not_closed",
+                    "seq": entry["seq"],
+                    "message": assessment.get("reason") or "比重杯读数不闭合",
+                    "measured_density_g_ml": assessment.get(
+                        "measured_density_g_ml"
+                    ),
+                    "theoretical_density_g_ml": assessment.get(
+                        "theoretical_density_g_ml"
+                    ),
+                    "difference_g_ml": assessment.get("difference_g_ml"),
+                    "tolerance_g_ml": DENSITY_CLOSURE_TOLERANCE_G_ML,
+                }
+            )
+    capacity = batch["container_capacity_ml"]
+    occupied = metrics["occupied_volume_ml"]
+    if occupied > capacity + 1e-9:
+        warnings.append(
+            {
+                "code": "container_overfill",
+                "message": f"占用体积 {occupied:.1f} mL 超出容器容量 {capacity:.1f} mL",
+                "occupied_volume_ml": round(occupied, 6),
+                "container_capacity_ml": capacity,
+                "excess_volume_ml": round(occupied - capacity, 6),
+            }
+        )
+    status = _target_status(metrics, batch)
+    if metrics["total_mass_g"] > 0.0 and not status["all_targets_met"]:
+        out = []
+        if not status["solids"]["in_range"]:
+            out.append("solids_fraction")
+        if not status["density"]["in_range"]:
+            out.append("density")
+        warnings.append(
+            {
+                "code": "target_out_of_range",
+                "message": f"当前指标偏离目标区间: {', '.join(out)}",
+                "metrics": out,
+                "solids": status["solids"],
+                "density": status["density"],
+            }
+        )
+    return warnings
+
+
+def assemble_slurry_batch(batch: dict) -> dict[str, Any]:
+    """重放台账并组装批次完整视图（计划参数、守恒状态、读数、告警）。"""
+    entries = db.list_slurry_entries(batch["id"])
+    state = _replay(batch, entries)
+    metrics = slurry.slurry_metrics(
+        state,
+        batch["powder_true_density_g_ml"],
+        batch["water_density_g_ml"],
+    )
+    metrics = {k: round(v, 9) for k, v in metrics.items()}
+    capacity = batch["container_capacity_ml"]
+    warnings = _build_warnings(batch, entries, metrics)
+    view = {
+        "id": batch["id"],
+        "version_id": batch["version_id"],
+        "status": batch["status"],
+        "note": batch["note"],
+        "targets": {
+            "target_dry_mass_kg": batch["target_dry_mass_kg"],
+            "solids_low": batch["solids_low"],
+            "solids_high": batch["solids_high"],
+            "density_low": batch["density_low"],
+            "density_high": batch["density_high"],
+            "additive_ratio": batch["additive_ratio"],
+        },
+        "constants": {
+            "powder_true_density_g_ml": batch["powder_true_density_g_ml"],
+            "water_temp_c": batch["water_temp_c"],
+            "water_density_g_ml": batch["water_density_g_ml"],
+            "container_capacity_ml": capacity,
+            "density_closure_tolerance_g_ml": DENSITY_CLOSURE_TOLERANCE_G_ML,
+            "constants_version": CONSTANTS_VERSION,
+        },
+        "initial_plan": batch["initial_plan"],
+        "recipe": batch["recipe_snapshot"],
+        "state": {
+            **metrics,
+            "free_volume_ml": round(max(capacity - metrics["occupied_volume_ml"], 0.0), 9),
+            "breakdown": _state_breakdown(state),
+            "target_status": _target_status(metrics, batch),
+        },
+        "warnings": warnings,
+        "entries": entries,
+        "n_entries": len(entries),
+        "freeze_id": batch["freeze_id"],
+        "created_at": batch["created_at"],
+        "updated_at": batch["updated_at"],
+        "finalized_at": batch["finalized_at"],
+    }
+    return view
+
+
+def _require_status(batch: dict, allowed: tuple[str, ...]) -> None:
+    if batch["status"] not in allowed:
+        raise GlazeError(
+            f"批次当前状态为 {batch['status']}，该操作仅允许 {list(allowed)} 状态",
+            "invalid_slurry_status",
+            {"status": batch["status"], "allowed": list(allowed)},
+        )
+
+
+def _check_recipe_materials(batch: dict, material_ids: list[int]) -> None:
+    recipe_ids = {m["material_id"] for m in batch["recipe_snapshot"]["materials"]}
+    outsiders = sorted(set(material_ids) - recipe_ids)
+    if outsiders:
+        raise GlazeError(
+            f"干料原料不属于来源冻结配方: {outsiders}",
+            "material_not_in_recipe",
+            {"material_ids": outsiders},
+        )
+
+
+def _metrics_after(
+    batch: dict, state: slurry.SlurryState
+) -> dict[str, Any]:
+    metrics = slurry.slurry_metrics(
+        state,
+        batch["powder_true_density_g_ml"],
+        batch["water_density_g_ml"],
+    )
+    overfill = metrics["occupied_volume_ml"] > batch["container_capacity_ml"] + 1e-9
+    return {
+        **{k: round(v, 9) for k, v in metrics.items()},
+        "breakdown": _state_breakdown(state),
+        "container_overfill": overfill,
+    }
+
+
+def start_slurry_batch(batch_id: str) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("planned",))
+    db.update_slurry_status(batch_id, "mixing")
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def add_slurry_entry(batch_id: str, req: SlurryAdditionRequest) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    dry_items = [
+        {"material_id": d.material_id, "mass_g": d.mass_g}
+        for d in req.dry_materials
+    ]
+    _check_recipe_materials(batch, [d["material_id"] for d in dry_items])
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    dry_g = sum(d["mass_g"] for d in dry_items)
+    state.add_direct(dry_g, req.water_g, req.additive_g)
+    payload = {
+        "dry_materials": dry_items,
+        "water_g": req.water_g,
+        "additive_g": req.additive_g,
+        "note": req.note,
+    }
+    db.append_slurry_entry(batch_id, "addition", payload, _metrics_after(batch, state))
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def add_slurry_recycle(batch_id: str, req: SlurryRecycleRequest) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    source = db.get_slurry_batch(req.source_batch_id)  # 404
+    if source["version_id"] != batch["version_id"]:
+        raise GlazeError(
+            f"回收浆来源批次 {source['id']} 的配方版本 {source['version_id']} "
+            f"与本批次 {batch['version_id']} 不一致，禁止混入",
+            "recycle_version_mismatch",
+            {
+                "source_batch_id": source["id"],
+                "source_version_id": source["version_id"],
+                "batch_version_id": batch["version_id"],
+            },
+        )
+    if source["status"] != "finalized" or not source.get("freeze_id"):
+        raise GlazeError(
+            f"回收浆来源批次 {source['id']} 尚未定稿，不能作为回收浆登记",
+            "recycle_source_not_finalized",
+            {"source_batch_id": source["id"], "status": source["status"]},
+        )
+    source_entries = db.list_slurry_entries(source["id"])
+    source_state = _replay(source, source_entries)
+    source_metrics = slurry.slurry_metrics(
+        source_state,
+        source["powder_true_density_g_ml"],
+        source["water_density_g_ml"],
+    )
+    split = slurry.split_recycle_mass(req.slurry_mass_g, source_metrics)
+
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    state.add_recycle(
+        split["dry_g"], split["water_g"], split["additive_g"]
+    )
+    payload = {
+        "source_batch_id": source["id"],
+        "source_version_id": source["version_id"],
+        "slurry_mass_g": req.slurry_mass_g,
+        "source_solids_fraction": round(split["solids_fraction"], 9),
+        "split": {k: round(v, 9) for k, v in split.items()},
+        "note": req.note,
+    }
+    db.append_slurry_entry(
+        batch_id, "recycle", payload, _metrics_after(batch, state)
+    )
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def add_slurry_premix(batch_id: str, req: SlurryPremixRequest) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    shares = [
+        {"material_id": m["material_id"], "share": m["share"]}
+        for m in batch["recipe_snapshot"]["materials"]
+    ]
+    breakdown = slurry.split_premix(req.premix_mass_g, shares)
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    state.add_premix(req.premix_mass_g, req.water_g)
+    payload = {
+        "premix_mass_g": req.premix_mass_g,
+        "water_g": req.water_g,
+        "breakdown": [
+            {
+                "material_id": line["material_id"],
+                "share": round(line["share"], 9),
+                "mass_g": round(line["mass_g"], 6),
+            }
+            for line in breakdown
+        ],
+        "note": req.note,
+    }
+    db.append_slurry_entry(batch_id, "premix", payload, _metrics_after(batch, state))
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def add_slurry_reading(batch_id: str, req: SlurryReadingRequest) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    metrics = slurry.slurry_metrics(
+        state,
+        batch["powder_true_density_g_ml"],
+        batch["water_density_g_ml"],
+    )
+    net_mass = req.full_cup_mass_g - req.empty_cup_mass_g
+    measured = net_mass / req.cup_volume_ml
+    rho_p = batch["powder_true_density_g_ml"]
+    rho_w = batch["water_density_g_ml"]
+
+    reason = None
+    closed = False
+    if metrics["total_mass_g"] <= 0.0:
+        reason = "批次内尚无任何物料，无法给出理论比重"
+    else:
+        theoretical = metrics["theoretical_density_g_ml"]
+        diff = abs(measured - theoretical)
+        closed = diff <= DENSITY_CLOSURE_TOLERANCE_G_ML + 1e-12
+        if not closed:
+            reason = (
+                f"实测比重 {measured:.4f} 与理论比重 {theoretical:.4f} 之差 "
+                f"{diff:.4f} 超过闭合容差 {DENSITY_CLOSURE_TOLERANCE_G_ML}"
+            )
+    implied_solids = slurry.implied_solids_from_density(measured, rho_p, rho_w)
+    physically_plausible = rho_w - 1e-6 <= measured <= rho_p + 1e-6
+    assessment = {
+        "measured_density_g_ml": round(measured, 9),
+        "net_cup_mass_g": round(net_mass, 9),
+        "theoretical_density_g_ml": round(metrics["theoretical_density_g_ml"], 9)
+        if metrics["total_mass_g"] > 0.0
+        else None,
+        "difference_g_ml": round(
+            abs(measured - metrics["theoretical_density_g_ml"]), 9
+        )
+        if metrics["total_mass_g"] > 0.0
+        else None,
+        "tolerance_g_ml": DENSITY_CLOSURE_TOLERANCE_G_ML,
+        "implied_solids_fraction": round(implied_solids, 9)
+        if implied_solids is not None
+        else None,
+        "physically_plausible": physically_plausible,
+        "closed": closed,
+        "reason": reason,
+    }
+    payload = {
+        "empty_cup_mass_g": req.empty_cup_mass_g,
+        "full_cup_mass_g": req.full_cup_mass_g,
+        "cup_volume_ml": req.cup_volume_ml,
+        "note": req.note,
+    }
+    db.append_slurry_entry(batch_id, "reading", payload, assessment)
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def search_slurry_corrections(
+    batch_id: str, req: SlurryCorrectionRequest
+) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    current = slurry.slurry_metrics(
+        state,
+        batch["powder_true_density_g_ml"],
+        batch["water_density_g_ml"],
+    )
+    result = slurry.search_corrections(
+        current=current,
+        solids_low=batch["solids_low"],
+        solids_high=batch["solids_high"],
+        density_low=batch["density_low"],
+        density_high=batch["density_high"],
+        powder_density_g_ml=batch["powder_true_density_g_ml"],
+        water_density_g_ml=batch["water_density_g_ml"],
+        container_capacity_ml=batch["container_capacity_ml"],
+        water_step_g=req.water_step_g,
+        premix_step_g=req.premix_step_g,
+        remaining_capacity_ml=req.remaining_capacity_ml,
+        max_candidates=req.max_candidates,
+    )
+    result["batch_id"] = batch["id"]
+    result["search_constraints"] = {
+        "water_step_g": req.water_step_g,
+        "premix_step_g": req.premix_step_g,
+        "remaining_capacity_ml": req.remaining_capacity_ml,
+        "max_candidates": req.max_candidates,
+    }
+    result["premix_breakdown"] = [
+        {
+            "material_id": m["material_id"],
+            "name": m["name"],
+            "share": round(m["share"], 9),
+        }
+        for m in batch["recipe_snapshot"]["materials"]
+    ]
+    result["constants_version"] = CONSTANTS_VERSION
+    return result
+
+
+def add_slurry_adjustment(batch_id: str, req: SlurryAdjustmentRequest) -> dict[str, Any]:
+    batch = db.get_slurry_batch(batch_id)  # 404
+    _require_status(batch, ("mixing",))
+    shares = [
+        {"material_id": m["material_id"], "share": m["share"]}
+        for m in batch["recipe_snapshot"]["materials"]
+    ]
+    breakdown = slurry.split_premix(req.premix_g, shares)
+    entries = db.list_slurry_entries(batch_id)
+    state = _replay(batch, entries)
+    state.add_premix(req.premix_g, req.water_g)
+    after = _metrics_after(batch, state)
+    payload = {
+        "water_g": req.water_g,
+        "premix_g": req.premix_g,
+        "premix_breakdown": [
+            {
+                "material_id": line["material_id"],
+                "share": round(line["share"], 9),
+                "mass_g": round(line["mass_g"], 6),
+            }
+            for line in breakdown
+        ],
+        "note": req.note,
+    }
+    db.append_slurry_entry(batch_id, "adjustment", payload, after)
+    return assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+def finalize_slurry_batch(batch_id: str, req: SlurryFinalizeRequest | None = None):
+    """定稿：冻结全部投料、读数、调整记录与计算常量。重复定稿返回同一结果。"""
+    batch = db.get_slurry_batch(batch_id)  # 404
+    if batch["status"] == "finalized" and batch.get("freeze_id"):
+        stored = db.get_slurry_freeze(batch["freeze_id"])
+        return stored, False
+    _require_status(batch, ("mixing",))
+
+    view = assemble_slurry_batch(batch)
+    if view["state"]["dry_mass_g"] <= 0.0:
+        raise GlazeError(
+            "批次内没有任何干物投入，无法定稿", "empty_slurry_batch"
+        )
+
+    constants = {
+        "constants_version": CONSTANTS_VERSION,
+        "segger_constants": constants_snapshot(),
+        "powder_true_density_g_ml": batch["powder_true_density_g_ml"],
+        "water_temp_c": batch["water_temp_c"],
+        "water_density_g_ml": batch["water_density_g_ml"],
+        "water_density_table": [
+            {"temp_c": t, "density_g_ml": d}
+            for t, d in slurry.WATER_DENSITY_TABLE
+        ],
+        "container_capacity_ml": batch["container_capacity_ml"],
+        "density_closure_tolerance_g_ml": DENSITY_CLOSURE_TOLERANCE_G_ML,
+        "additive_ratio": batch["additive_ratio"],
+    }
+    final_state = {
+        **view["state"],
+        "warnings": view["warnings"],
+    }
+    snapshot = {
+        "batch_id": batch["id"],
+        "version_id": batch["version_id"],
+        "targets": view["targets"],
+        "initial_plan": batch["initial_plan"],
+        "recipe_snapshot": batch["recipe_snapshot"],
+        "entries": view["entries"],
+        "constants": constants,
+        "note": req.note if req is not None else batch["note"],
+    }
+    # 冻结 id 取决于全部语义内容：同批次台账不变则哈希稳定（幂等兜底）
+    freeze_hash = _canonical_hash(
+        {
+            "batch_id": batch["id"],
+            "final_state": final_state,
+            "snapshot": snapshot,
+        }
+    )
+    freeze_id = "slf_" + freeze_hash
+    stored, created = db.save_slurry_freeze(
+        freeze_id=freeze_id,
+        batch_id=batch["id"],
+        note=req.note if req is not None else batch["note"],
+        final_state=final_state,
+        snapshot=snapshot,
+    )
+    db.update_slurry_status(batch["id"], "finalized", freeze_id=stored["id"])
+    return stored, created

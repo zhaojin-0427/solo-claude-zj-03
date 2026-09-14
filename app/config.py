@@ -85,6 +85,10 @@ DEFAULT_STUDY_SEED = 20260913  # 缺省随机种子（固定种子保证可复�
 ROBUST_MAX_ITERS = 40          # 稳健配方搜索的贪心迭代上限
 TOP_VIOLATION_COMBOS = 5       # 结果中返回的常见越界组合条数
 
+# 釉浆调制参数
+DENSITY_CLOSURE_TOLERANCE_G_ML = 0.02  # 比重杯实测与理论比重的闭合容差（g/mL）
+CORRECTION_MAX_GRID_COMBOS = 200_000   # 纠偏网格枚举组合数上限
+
 
 class Settings(BaseModel):
     db_path: str = str(Path(__file__).resolve().parent.parent / "glaze.db")

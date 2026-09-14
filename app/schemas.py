@@ -678,3 +678,179 @@ class BlendFreezeRequest(BaseModel):
                 "leftover_without_batch",
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# 釉浆调制批次
+# ---------------------------------------------------------------------------
+
+class SlurryBatchCreate(BaseModel):
+    """从一份冻结配方创建釉浆调制批次：目标参数与调制常量。"""
+
+    version_id: str = Field(min_length=1, description="来源冻结配方版本 id")
+    target_dry_mass_kg: float = Field(..., gt=0.0, description="目标干料量（kg，生料）")
+    solids_low: float = Field(
+        ..., gt=0.0, lt=1.0, description="目标固含率下限（质量分数，0~1）"
+    )
+    solids_high: float = Field(
+        ..., gt=0.0, lt=1.0, description="目标固含率上限（质量分数，0~1）"
+    )
+    density_low: float = Field(
+        ..., gt=0.0, description="目标比重下限（相对密度，g/mL 数值）"
+    )
+    density_high: float = Field(
+        ..., gt=0.0, description="目标比重上限（相对密度，g/mL 数值）"
+    )
+    powder_true_density_kg_l: float = Field(
+        ..., gt=0.0, description="粉体真密度（kg/L，数值等同 g/mL）"
+    )
+    water_temp_c: float = Field(..., description="调制水温（°C，0~100）")
+    container_capacity_l: float = Field(
+        ..., gt=0.0, description="调制容器容量（L）"
+    )
+    additive_ratio: float = Field(
+        ..., ge=0.0, le=1.0,
+        description="添加剂占干料的质量比例（初始称量用，0~1）",
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "SlurryBatchCreate":
+        if self.solids_low > self.solids_high:
+            raise GlazeError(
+                f"固含率区间矛盾: low={self.solids_low} > high={self.solids_high}",
+                "contradictory_bounds",
+                {"low": self.solids_low, "high": self.solids_high},
+            )
+        if self.density_low > self.density_high:
+            raise GlazeError(
+                f"比重区间矛盾: low={self.density_low} > high={self.density_high}",
+                "contradictory_bounds",
+                {"low": self.density_low, "high": self.density_high},
+            )
+        if not 0.0 <= self.water_temp_c <= 100.0:
+            raise GlazeError(
+                f"水温 {self.water_temp_c} °C 超出支持范围 0~100 °C",
+                "water_temp_out_of_range",
+                {"water_temp_c": self.water_temp_c},
+            )
+        return self
+
+
+class SlurryDryAddition(BaseModel):
+    """逐笔直接登记的单项干料实际加入量。"""
+
+    material_id: int
+    mass_g: float = Field(..., gt=0.0, description="实际加入质量（g）")
+
+
+class SlurryAdditionRequest(BaseModel):
+    """登记一笔实际投料：干料（可多项）、水、添加剂至少一种为正。
+
+    回收浆与预混粉通过各自字段单独登记，互不混用。
+    """
+
+    dry_materials: list[SlurryDryAddition] = Field(default_factory=list)
+    water_g: float = Field(0.0, ge=0.0, description="实际加入水质量（g）")
+    additive_g: float = Field(0.0, ge=0.0, description="实际加入添加剂质量（g）")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "SlurryAdditionRequest":
+        ids = [d.material_id for d in self.dry_materials]
+        if len(set(ids)) != len(ids):
+            raise GlazeError(
+                "同一笔投料中干料原料重复，请合并后登记",
+                "duplicate_material",
+                {"material_ids": ids},
+            )
+        total = sum(d.mass_g for d in self.dry_materials)
+        total += self.water_g + self.additive_g
+        if total <= 0.0:
+            raise GlazeError(
+                "空投料登记：干料、水、添加剂至少需要一项为正",
+                "empty_addition",
+            )
+        return self
+
+
+class SlurryRecycleRequest(BaseModel):
+    """登记一笔同配方回收浆：来源必须为同版本已定稿批次。"""
+
+    source_batch_id: str = Field(min_length=1, description="回收浆来源批次 id")
+    slurry_mass_g: float = Field(..., gt=0.0, description="回收浆总质量（g）")
+    note: Optional[str] = None
+
+
+class SlurryPremixRequest(BaseModel):
+    """登记一笔同配方预混粉（按冻结配方比例预配的干料）。"""
+
+    premix_mass_g: float = Field(..., gt=0.0, description="预混粉总质量（g）")
+    water_g: float = Field(
+        0.0, ge=0.0, description="随预混粉同时加入的水质量（g）"
+    )
+    note: Optional[str] = None
+
+
+class SlurryReadingRequest(BaseModel):
+    """比重杯读数：空杯质量、满杯质量与杯容积。"""
+
+    empty_cup_mass_g: float = Field(..., ge=0.0, description="空杯质量（g）")
+    full_cup_mass_g: float = Field(..., ge=0.0, description="满杯质量（g）")
+    cup_volume_ml: float = Field(..., gt=0.0, description="杯容积（mL）")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "SlurryReadingRequest":
+        if self.full_cup_mass_g < self.empty_cup_mass_g:
+            raise GlazeError(
+                f"满杯质量 {self.full_cup_mass_g} g 小于空杯质量 "
+                f"{self.empty_cup_mass_g} g，读数不闭合",
+                "cup_reading_inverted",
+                {
+                    "empty_cup_mass_g": self.empty_cup_mass_g,
+                    "full_cup_mass_g": self.full_cup_mass_g,
+                },
+            )
+        return self
+
+
+class SlurryCorrectionRequest(BaseModel):
+    """纠偏方案搜索：限定加水/预混粉步进与剩余容量。"""
+
+    water_step_g: float = Field(
+        10.0, gt=0.0, description="加水步进（g），方案水量为其整数倍"
+    )
+    premix_step_g: float = Field(
+        10.0, gt=0.0, description="同配方预混粉步进（g），粉量为其整数倍"
+    )
+    remaining_capacity_ml: Optional[float] = Field(
+        default=None, ge=0.0,
+        description="调用方限定的剩余容量（mL），缺省取容器实际空余",
+    )
+    max_candidates: int = Field(20, ge=1, le=100, description="返回方案条数上限")
+
+
+class SlurryAdjustmentRequest(BaseModel):
+    """登记一笔已执行的纠偏调整：加水与/或加同配方预混粉。"""
+
+    water_g: float = Field(0.0, ge=0.0, description="实际补加水质量（g）")
+    premix_g: float = Field(
+        0.0, ge=0.0, description="实际补加同配方预混粉质量（g）"
+    )
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "SlurryAdjustmentRequest":
+        if self.water_g + self.premix_g <= 0.0:
+            raise GlazeError(
+                "空调整记录：补加水与预混粉至少需要一项为正",
+                "empty_adjustment",
+            )
+        return self
+
+
+class SlurryFinalizeRequest(BaseModel):
+    """定稿请求（可选备注）；定稿幂等，重复提交返回同一冻结结果。"""
+
+    note: Optional[str] = None

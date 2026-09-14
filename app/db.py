@@ -1,8 +1,9 @@
-"""SQLite 持久层：原料库、不可变配方版本与批次波动研究。
+"""SQLite 持久层：原料库、不可变配方版本、批次波动研究与釉浆调制批次。
 
 只有原料允许更新/删除；``recipe_versions``、``studies``、
 ``robust_versions`` 仅 INSERT 与 SELECT，通过对输入哈希建唯一索引
-实现"同一版本重复读取保持一致"。
+实现"同一版本重复读取保持一致"。釉浆批次在 planned/mixing 期间
+可追加台账，定稿（``slurry_freezes``）后全部记录冻结且幂等。
 """
 from __future__ import annotations
 
@@ -94,6 +95,49 @@ CREATE TABLE IF NOT EXISTS blend_versions (
     plan               TEXT NOT NULL,             -- 选定方案（母料拆分+称量顺序）
     source_snapshot    TEXT NOT NULL,             -- 来源配方+布局+常量完整快照
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS slurry_batches (
+    id                        TEXT PRIMARY KEY,    -- slb_<uuid>
+    version_id                TEXT NOT NULL,       -- 来源冻结配方版本
+    status                    TEXT NOT NULL,       -- planned / mixing / finalized
+    target_dry_mass_kg        REAL NOT NULL,
+    solids_low                REAL NOT NULL,
+    solids_high               REAL NOT NULL,
+    density_low               REAL NOT NULL,
+    density_high              REAL NOT NULL,
+    powder_true_density_g_ml  REAL NOT NULL,       -- kg/L 与 g/mL 数值相同
+    water_temp_c              REAL NOT NULL,
+    water_density_g_ml        REAL NOT NULL,       -- 创建时按水温插值
+    container_capacity_ml     REAL NOT NULL,
+    additive_ratio            REAL NOT NULL,
+    note                      TEXT,
+    initial_plan              TEXT NOT NULL,       -- 初始称量（干料/水/添加剂）
+    recipe_snapshot           TEXT NOT NULL,       -- 来源版本 id/投料/份额/原料名
+    freeze_id                 TEXT,                -- 定稿后指向 slurry_freezes.id
+    created_at                TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at                TEXT NOT NULL DEFAULT (datetime('now')),
+    finalized_at              TEXT
+);
+
+CREATE TABLE IF NOT EXISTS slurry_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    TEXT NOT NULL,          -- 来源调制批次
+    seq         INTEGER NOT NULL,       -- 批次内严格递增的台账序号
+    entry_type  TEXT NOT NULL,          -- addition/recycle/premix/adjustment/reading
+    payload     TEXT NOT NULL,          -- 逐笔登记的原始内容
+    state_after TEXT,                   -- 台账动作后的守恒状态；读数为闭合评估
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (batch_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS slurry_freezes (
+    id          TEXT PRIMARY KEY,       -- slf_<hash>
+    batch_id    TEXT NOT NULL UNIQUE,   -- 一批次只能定稿一次，重复定稿取旧记录
+    note        TEXT,
+    final_state TEXT NOT NULL,          -- 定稿时刻质量守恒状态与告警
+    snapshot    TEXT NOT NULL,          -- 投料/读数/调整/计算常量完整快照
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -626,4 +670,205 @@ def _blend_version_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     for key in ("search_constraints", "plan", "source_snapshot"):
         data[key] = json.loads(data[key])
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 釉浆调制批次（计划/调制中可变；定稿后冻结）
+# ---------------------------------------------------------------------------
+
+def create_slurry_batch(
+    *,
+    batch_id: str,
+    version_id: str,
+    params: dict[str, Any],
+    initial_plan: dict[str, Any],
+    recipe_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO slurry_batches
+                   (id, version_id, status, target_dry_mass_kg,
+                    solids_low, solids_high, density_low, density_high,
+                    powder_true_density_g_ml, water_temp_c, water_density_g_ml,
+                    container_capacity_ml, additive_ratio, note,
+                    initial_plan, recipe_snapshot)
+               VALUES (?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                batch_id,
+                version_id,
+                params["target_dry_mass_kg"],
+                params["solids_low"],
+                params["solids_high"],
+                params["density_low"],
+                params["density_high"],
+                params["powder_true_density_kg_l"],
+                params["water_temp_c"],
+                params["water_density_g_ml"],
+                params["container_capacity_ml"],
+                params["additive_ratio"],
+                params.get("note"),
+                json.dumps(initial_plan, sort_keys=True, ensure_ascii=False),
+                json.dumps(recipe_snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+    return get_slurry_batch(batch_id)
+
+
+def get_slurry_batch(batch_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM slurry_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"釉浆调制批次不存在: {batch_id}", "slurry_batch_not_found"
+        )
+    return _slurry_row_to_dict(row)
+
+
+def list_slurry_batches(limit: int = 50) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM slurry_batches ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_slurry_row_to_dict(r) for r in rows]
+
+
+def update_slurry_status(
+    batch_id: str, status: str, freeze_id: Optional[str] = None
+) -> None:
+    with get_conn() as conn:
+        if status == "finalized":
+            conn.execute(
+                """UPDATE slurry_batches
+                   SET status=?, freeze_id=?,
+                       finalized_at=datetime('now'), updated_at=datetime('now')
+                   WHERE id=?""",
+                (status, freeze_id, batch_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE slurry_batches SET status=?, updated_at=datetime('now') "
+                "WHERE id=?",
+                (status, batch_id),
+            )
+
+
+def append_slurry_entry(
+    batch_id: str,
+    entry_type: str,
+    payload: dict[str, Any],
+    state_after: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """追加一条台账（投料/回收浆/预混粉/调整/读数），序号严格递增。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM slurry_entries "
+            "WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        seq = int(row["max_seq"]) + 1
+        conn.execute(
+            """INSERT INTO slurry_entries
+                   (batch_id, seq, entry_type, payload, state_after)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                batch_id,
+                seq,
+                entry_type,
+                json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                json.dumps(state_after, sort_keys=True, ensure_ascii=False)
+                if state_after is not None
+                else None,
+            ),
+        )
+        saved = conn.execute(
+            "SELECT * FROM slurry_entries WHERE batch_id = ? AND seq = ?",
+            (batch_id, seq),
+        ).fetchone()
+    return _slurry_entry_row_to_dict(saved)
+
+
+def list_slurry_entries(batch_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM slurry_entries WHERE batch_id = ? ORDER BY seq",
+            (batch_id,),
+        ).fetchall()
+    return [_slurry_entry_row_to_dict(r) for r in rows]
+
+
+def save_slurry_freeze(
+    *,
+    freeze_id: str,
+    batch_id: str,
+    note: Optional[str],
+    final_state: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """定稿冻结；同批次已有冻结记录则直接返回旧记录（幂等）。"""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM slurry_freezes WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if existing is not None:
+            return _slurry_freeze_row_to_dict(existing), False
+        conn.execute(
+            """INSERT INTO slurry_freezes (id, batch_id, note, final_state, snapshot)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                freeze_id,
+                batch_id,
+                note,
+                json.dumps(final_state, sort_keys=True, ensure_ascii=False),
+                json.dumps(snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM slurry_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    return _slurry_freeze_row_to_dict(row), True
+
+
+def get_slurry_freeze(freeze_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM slurry_freezes WHERE id = ?", (freeze_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"釉浆定稿冻结不存在: {freeze_id}", "slurry_freeze_not_found"
+        )
+    return _slurry_freeze_row_to_dict(row)
+
+
+def find_slurry_freeze(batch_id: str) -> Optional[dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM slurry_freezes WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+    return _slurry_freeze_row_to_dict(row) if row is not None else None
+
+
+def _slurry_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["initial_plan"] = json.loads(data["initial_plan"])
+    data["recipe_snapshot"] = json.loads(data["recipe_snapshot"])
+    return data
+
+
+def _slurry_entry_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["payload"] = json.loads(data["payload"])
+    if data.get("state_after"):
+        data["state_after"] = json.loads(data["state_after"])
+    return data
+
+
+def _slurry_freeze_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["final_state"] = json.loads(data["final_state"])
+    data["snapshot"] = json.loads(data["snapshot"])
     return data

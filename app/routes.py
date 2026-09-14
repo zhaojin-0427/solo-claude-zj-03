@@ -1,4 +1,4 @@
-"""FastAPI 路由：原料库、直接计算、搜索重配、不可变版本。"""
+"""FastAPI 路由：原料库、直接计算、搜索重配、不可变版本与釉浆调制批次。"""
 from __future__ import annotations
 
 from typing import Any
@@ -19,6 +19,14 @@ from .schemas import (
     RobustFreezeRequest,
     RobustSearchRequest,
     SearchRequest,
+    SlurryAdditionRequest,
+    SlurryAdjustmentRequest,
+    SlurryBatchCreate,
+    SlurryCorrectionRequest,
+    SlurryFinalizeRequest,
+    SlurryPremixRequest,
+    SlurryReadingRequest,
+    SlurryRecycleRequest,
     StudyRequest,
 )
 
@@ -219,3 +227,80 @@ def list_blend_freezes(
 @router.get("/blend-versions/{freeze_id}")
 def get_blend_version(freeze_id: str) -> dict[str, Any]:
     return db.get_blend_version(freeze_id)
+
+
+# ---------------------------------------------------------------------------
+# 釉浆调制批次（计划 -> 调制中 -> 定稿）
+# ---------------------------------------------------------------------------
+
+@router.post("/slurry-batches", status_code=201)
+def create_slurry_batch(req: SlurryBatchCreate) -> dict[str, Any]:
+    """从一份冻结配方建立釉浆调制批次（状态 planned），返回初始称量计划。"""
+    return service.create_slurry_batch(req)
+
+
+@router.get("/slurry-batches")
+def list_slurry_batches(limit: int = Query(50, ge=1, le=500)) -> list[dict]:
+    return [service.assemble_slurry_batch(b) for b in db.list_slurry_batches(limit)]
+
+
+@router.get("/slurry-batches/{batch_id}")
+def get_slurry_batch(batch_id: str) -> dict[str, Any]:
+    return service.assemble_slurry_batch(db.get_slurry_batch(batch_id))
+
+
+@router.post("/slurry-batches/{batch_id}/start", status_code=201)
+def start_slurry_batch(batch_id: str) -> dict[str, Any]:
+    """planned -> mixing，开始调制并允许登记台账。"""
+    return service.start_slurry_batch(batch_id)
+
+
+@router.post("/slurry-batches/{batch_id}/additions", status_code=201)
+def add_slurry_entry(batch_id: str, req: SlurryAdditionRequest) -> dict[str, Any]:
+    """逐笔登记实际加入的干料、水、添加剂。"""
+    return service.add_slurry_entry(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/recycles", status_code=201)
+def add_slurry_recycle(batch_id: str, req: SlurryRecycleRequest) -> dict[str, Any]:
+    """逐笔登记同一配方已定稿批次的回收浆。"""
+    return service.add_slurry_recycle(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/premix", status_code=201)
+def add_slurry_premix(batch_id: str, req: SlurryPremixRequest) -> dict[str, Any]:
+    """登记一笔同配方预混粉（可带水），按配方份额给出各原料折合量。"""
+    return service.add_slurry_premix(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/readings", status_code=201)
+def add_slurry_reading(batch_id: str, req: SlurryReadingRequest) -> dict[str, Any]:
+    """提交比重杯空杯/满杯/容积读数，评估是否与理论比重闭合。"""
+    return service.add_slurry_reading(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/correction-search")
+def slurry_correction_search(batch_id: str, req: SlurryCorrectionRequest) -> dict[str, Any]:
+    """限定步进与剩余容量，搜索使固含率/比重进入目标区间的纠偏方案。"""
+    return service.search_slurry_corrections(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/adjustments", status_code=201)
+def add_slurry_adjustment(batch_id: str, req: SlurryAdjustmentRequest) -> dict[str, Any]:
+    """登记一笔已执行的纠偏调整（加水 / 加同配方预混粉）。"""
+    return service.add_slurry_adjustment(batch_id, req)
+
+
+@router.post("/slurry-batches/{batch_id}/finalize", status_code=201)
+def finalize_slurry_batch(
+    batch_id: str, req: SlurryFinalizeRequest | None = None
+) -> dict[str, Any]:
+    """定稿冻结全部台账与计算常量；重复定稿返回同一结果（created=False）。"""
+    payload = req if req is not None else SlurryFinalizeRequest.model_validate({})
+    stored, created = service.finalize_slurry_batch(batch_id, payload)
+    return {"created": created, "freeze": stored}
+
+
+@router.get("/slurry-freezes/{freeze_id}")
+def get_slurry_freeze(freeze_id: str) -> dict[str, Any]:
+    return db.get_slurry_freeze(freeze_id)
